@@ -1,5 +1,5 @@
 /*
- * SilverSky v0.2.2 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
+ * SilverSky v0.2.3 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
  *   PSL1GHT + nucleo libretro Snes9x 2010
  *
  * Se construye sobre la estructura de red de NesNet (copia: NesNet no se toca):
@@ -462,6 +462,7 @@ static void au_close(void) {}
 
 /* AUDIO-GENERIC-BEGIN */
 static int      g_volume = 100;        /* v1.9: volumen 0..100 (100 = igual que siempre) */
+static int      g_au_stretch = 1;      /* v0.2.3: 1 = si la emulacion se atrasa, el audio se estira (baja el tono) en vez de cortarse; 0 = como en v0.2.2 */
 static void au_reset(void)
 {
     g_aq_head = 0; g_aq_cnt = 0; g_aq_pos = 0.0;
@@ -503,12 +504,23 @@ static double au_calc_step(void)
     double base = g_au_inrate / AU_OUT_RATE;
     double fill = (double)g_au_queued * AU_BLK + (double)g_aq_cnt / base;
     double e = (fill - AU_FILL_T) / AU_FILL_T;
-    double s;
+    double s, lo = 0.99;
     if (e > 1.0) e = 1.0; else if (e < -1.0) e = -1.0;
     s = base * (1.0 + 0.01 * e);
+    /* v0.2.3: con OPCIONES > AUDIO = ESTIRAR, si el audio acumulado cae mucho (la emulacion va mas lenta que el tiempo real,
+     * ej. 53 fps), la lectura se frena hasta ~22 % en vez de dejar que el anillo se vacie y suene el corte. En marcha
+     * normal (e > -0.55: en los logs sanos e ronda -0.3) no se toca nada y el paso es exactamente el de v0.2.2. */
+    if (g_au_stretch) {
+        lo = 0.78;
+        if (e < -0.55) {
+            double x = (e + 0.55) / 0.35;               /* 0 .. -1 */
+            if (x < -1.0) x = -1.0;
+            s *= 1.0 + 0.20 * x;
+        }
+    }
     g_au_step_s += 0.05 * (s - g_au_step_s);
     if (g_au_step_s > base * 1.01) g_au_step_s = base * 1.01;
-    if (g_au_step_s < base * 0.99) g_au_step_s = base * 0.99;
+    if (g_au_step_s < base * lo) g_au_step_s = base * lo;
     return g_au_step_s;
 }
 
@@ -764,6 +776,7 @@ static void opts_defaults(void)
     g_screen = 0;
     g_volume = 100;
     g_netinfo = 0;
+    g_au_stretch = 1;
     g_last_rom[0] = 0;
 }
 
@@ -779,6 +792,7 @@ static void opts_save(void)
     fprintf(f, "screen=%d\n", g_screen);
     fprintf(f, "volume=%d\n", g_volume);
     fprintf(f, "netinfo=%d\n", g_netinfo);
+    fprintf(f, "stretch=%d\n", g_au_stretch);
     if (g_last_rom[0]) fprintf(f, "rom=%s\n", g_last_rom);
     fclose(f);
     remove(path);
@@ -802,6 +816,8 @@ static void opts_load(void)
             if (v0 >= 0 && v0 <= 100) g_volume = v0;
         } else if (sscanf(line, "netinfo=%d", &v0) == 1) {
             if (v0 >= 0 && v0 <= 2) g_netinfo = v0;
+        } else if (sscanf(line, "stretch=%d", &v0) == 1) {
+            if (v0 >= 0 && v0 <= 1) g_au_stretch = v0;
         } else if (!strncmp(line, "rom=", 4)) {
             size_t n = strlen(line + 4);
             while (n > 0 && (line[4 + n - 1] == '\n' || line[4 + n - 1] == '\r')) n--;
@@ -809,7 +825,7 @@ static void opts_load(void)
         }
     }
     fclose(f);
-    logf_("opciones: pantalla=%d volumen=%d info_red=%d", g_screen, g_volume, g_netinfo);
+    logf_("opciones: pantalla=%d volumen=%d info_red=%d audio_estirar=%d", g_screen, g_volume, g_netinfo, g_au_stretch);
     if (g_last_rom[0]) logf_("opciones: ultima ROM = %s", g_last_rom);
 }
 
@@ -2928,9 +2944,43 @@ static void ui_opt_netinfo(void)
     logf_("opciones: info de red = %d", g_netinfo);
 }
 
+/* v0.2.3: OPCIONES > AUDIO SI VA LENTO. Solo cambia que pasa con el sonido cuando la consola no llega a 60 fps; si va a 60 no hace nada. */
+static void ui_opt_stretch(void)
+{
+    static const char *names[2] = { "NORMAL (COMO ANTES)", "ESTIRAR (EL SONIDO BAJA UN POCO)" };
+    static const char *desc[2] = { "SI SE ATRASA, EL AUDIO PUEDE CORTARSE", "SI SE ATRASA, NO SE CORTA: SUENA MAS LENTO" };
+    int i;
+    g_stage = "opciones-audio-lento";
+    ui_prime();
+    while (g_running) {
+        uint16_t e;
+        pump();
+        e = ui_edges();
+        if (e & (UI_UP | UI_DOWN)) { g_au_stretch = !g_au_stretch; opts_save(); }
+        if (e & (UI_OK | UI_CANCEL | UI_START)) break;
+        ui_clear();
+        ui_center(20, "AUDIO SI VA LENTO", 2, 0xFFFFD040);
+        ui_center(46, "SOLO PASA CUANDO NO LLEGA A 60 FPS", 1, 0xFFC0C0FF);
+        for (i = 0; i < 2; i++) {
+            char line[48];
+            snprintf(line, sizeof line, "%s %s", i == g_au_stretch ? ">" : " ", names[i]);
+            ui_center(84 + i * 22, line, 1, i == g_au_stretch ? 0xFFFFFFFF : 0xFF8080A0);
+        }
+        ui_center(150, desc[g_au_stretch], 1, 0xFF80FF80);
+        if (!g_cfg.audio) ui_center(170, "AVISO: SONIDO APAGADO (R2 AL ABRIR)", 1, 0xFFFFC040);
+        ui_center(200, "ARRIBA/ABAJO: CAMBIAR", 1, 0xFF8080A0);
+        ui_center(214, "X / O: VOLVER", 1, 0xFF8080A0);
+        present();
+#ifdef NESNET_HOST
+        sleep_ms(16);
+#endif
+    }
+    logf_("opciones: audio estirar = %d", g_au_stretch);
+}
+
 static void ui_options(void)
 {
-    static const char *items[4] = { "PANTALLA", "SONIDO (VOLUMEN)", "INFO DE RED EN PARTIDA", "VOLVER" };
+    static const char *items[5] = { "PANTALLA", "SONIDO (VOLUMEN)", "INFO DE RED EN PARTIDA", "AUDIO SI VA LENTO", "VOLVER" };
     int sel = 0, i;
     g_stage = "opciones";
     ui_prime();
@@ -2938,19 +2988,20 @@ static void ui_options(void)
         uint16_t e;
         pump();
         e = ui_edges();
-        if (e & UI_UP)   sel = (sel + 3) % 4;
-        if (e & UI_DOWN) sel = (sel + 1) % 4;
+        if (e & UI_UP)   sel = (sel + 4) % 5;
+        if (e & UI_DOWN) sel = (sel + 1) % 5;
         if (e & UI_CANCEL) break;
         if (e & (UI_OK | UI_START)) {
             if (sel == 0) { ui_opt_screen(); ui_prime(); g_stage = "opciones"; }
             else if (sel == 1) { ui_opt_sound(); ui_prime(); g_stage = "opciones"; }
             else if (sel == 2) { ui_opt_netinfo(); ui_prime(); g_stage = "opciones"; }
+            else if (sel == 3) { ui_opt_stretch(); ui_prime(); g_stage = "opciones"; }
             else break;
         }
         ui_clear();
         ui_center(20, "OPCIONES", 2, 0xFFFFD040);
         ui_center(46, "SE GUARDAN SOLAS", 1, 0xFFC0C0FF);
-        for (i = 0; i < 4; i++) {
+        for (i = 0; i < 5; i++) {
             char line[40];
             snprintf(line, sizeof line, "%s %s", i == sel ? ">" : " ", items[i]);
             ui_center(76 + i * 20, line, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
@@ -3249,7 +3300,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.2.2 (medidor de rendimiento, sin hash en solo) - dir=%s", g_dir);
+    logf_("SilverSky v0.2.3 (audio estirable, medidor, sin hash en solo) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
