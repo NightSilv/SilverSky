@@ -1,1 +1,140 @@
+name: Build SilverSky
 
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SNES9X_SHA: fe690dd321fa5a46b5234a2bde089d2518c62b0e
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install gcc libelf-dev autoconf automake bison flex make texinfo patch wget zlib1g-dev libtool-bin bzip2 pkg-config libssl-dev p7zip-full
+
+      - name: Download PS3 SDK (ps3dev)
+        run: |
+          set -e
+          pick() {
+            gh api "repos/$1/releases?per_page=40" --jq '
+              [ .[] | select(.draft | not) | .assets[]?
+                | select(.name | test("ubuntu|linux"; "i"))
+                | select(.name | test("\\.tar\\.gz$"))
+                | select(.name | test("mac|osx|win|arm|aarch"; "i") | not) ]
+              | .[0].browser_download_url // empty'
+          }
+          for repo in ps3dev/ps3dev ps3dev/ps3toolchain; do
+            echo "=== releases de $repo"
+            gh api "repos/$repo/releases?per_page=15" --jq '.[] | "\(.tag_name) pre=\(.prerelease) :: \([.assets[].name] | join(", "))"' || true
+          done
+          URL=$(pick ps3dev/ps3dev)
+          FULL=1
+          if [ -z "$URL" ]; then
+            URL=$(pick ps3dev/ps3toolchain)
+            FULL=0
+          fi
+          if [ -z "$URL" ]; then
+            echo "::error::No encontre ningun SDK de PS3 precompilado para Linux"
+            exit 1
+          fi
+          echo "Descargando: $URL (sdk completo = $FULL)"
+          curl -fL --retry 3 "$URL" -o sdk.tar.gz
+          tar xzf sdk.tar.gz -C "$GITHUB_WORKSPACE"
+          echo "PS3DEV=$GITHUB_WORKSPACE/ps3dev" >> "$GITHUB_ENV"
+          echo "PSL1GHT=$GITHUB_WORKSPACE/ps3dev" >> "$GITHUB_ENV"
+          echo "PATH=$PATH:$GITHUB_WORKSPACE/ps3dev/bin:$GITHUB_WORKSPACE/ps3dev/ppu/bin:$GITHUB_WORKSPACE/ps3dev/spu/bin" >> "$GITHUB_ENV"
+          echo "SDK_FULL=$FULL" >> "$GITHUB_ENV"
+
+      - name: Build PSL1GHT (solo si el SDK descargado no lo trae)
+        run: |
+          set -e
+          if [ ! -f "$PSL1GHT/ppu_rules" ] || [ ! -f "$PS3DEV/ppu/lib/libnet.a" ]; then
+            echo "El SDK no trae PSL1GHT completo, lo compilo desde el codigo fuente"
+            git clone --depth 1 https://github.com/ps3dev/PSL1GHT.git psl1ght-src
+            cd psl1ght-src
+            make install-ctrl
+            make
+            make install
+          fi
+
+      - name: Comprobar SDK
+        run: |
+          echo "PS3DEV=$PS3DEV"
+          ls "$PS3DEV" | head -30
+          test -x "$PS3DEV/ppu/bin/ppu-gcc" || { echo "::error::Falta ppu-gcc"; exit 1; }
+          test -f "$PSL1GHT/ppu_rules"      || { echo "::error::Falta ppu_rules"; exit 1; }
+          test -f "$PS3DEV/ppu/lib/libnet.a" || { echo "::error::Falta libnet.a"; exit 1; }
+          ppu-gcc --version | head -1
+
+      - name: Compilar nucleo Snes9x 2010 (fijado a un commit, sin hilos)
+        run: |
+          set -e
+          mkdir snes9x2010
+          cd snes9x2010
+          git init -q
+          git remote add origin https://github.com/libretro/snes9x2010.git
+          git fetch --depth 1 origin "$SNES9X_SHA"
+          git checkout -q FETCH_HEAD
+          # HAVE_THREADS=0: el render del nucleo corre en el mismo hilo (en el PC dio resultados identicos al de hilos)
+          # make -k: si hay errores salen TODOS juntos en un solo intento
+          set +e
+          make -k -f Makefile.libretro platform=psl1ght HAVE_THREADS=0 -j"$(nproc)" 2>&1 | tee ../core_build.log
+          set -e
+          grep -n "error" ../core_build.log | head -40 || true
+          ls -la snes9x2010_libretro_psl1ght.a
+
+      - name: Crear config.txt de ejemplo
+        run: |
+          mkdir -p data/USRDIR
+          cat > data/USRDIR/config.txt <<'CFG'
+          # SilverSky - configuracion
+          # rom: (sin uso normal) la ROM se elige en el menu ELEGIR ROM; las ROMs van en la carpeta roms/
+          rom=
+          # mode: se ignora (siempre arranca el menu)
+          mode=
+          # port: puerto TCP de la sala (el host debe tenerlo abierto). NesNet usa 7777, SilverSky 7778
+          port=7778
+          # delay: 0 = automatico segun la latencia medida
+          delay=0
+          # public_ip: solo si SilverSky no logra averiguar tu IP publica (ejemplo: 181.45.200.17)
+          public_ip=
+          # code: codigo de sala para el cliente (si se deja vacio se escribe con el mando)
+          code=
+          # res: vacio = 720p (por defecto) | auto = la resolucion de tu TV
+          res=
+          # render: vacio = cpu (por defecto, dibujo directo sin la GPU) | gpu = usa la GPU (se colgo en las pruebas de NesNet)
+          render=
+          # zoom: vacio = automatico (1, 2, 3 o 4)
+          zoom=
+          # audio: vacio = con sonido | off = sin sonido (tambien se apaga manteniendo R2 al abrir)
+          audio=
+          CFG
+          sed -i 's/^          //' data/USRDIR/config.txt
+          cat data/USRDIR/config.txt
+
+      - name: Compilar SilverSky
+        run: |
+          set +e
+          make -k -j"$(nproc)" pkg 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          grep -n "error" build.log | head -40 || true
+          test "$rc" = "0"
+          ls -la SilverSky*.pkg build/pkg/USRDIR/
+
+      - name: Guardar paquetes
+        uses: actions/upload-artifact@v4
+        with:
+          name: SilverSky
+          path: |
+            SilverSky.pkg
+            SilverSky.gnpdrm.pkg
+          if-no-files-found: error
