@@ -57,7 +57,7 @@ $(LRC)/%.o: CFLAGS += -D__LIBRETRO__ -DHAVE_RPNG -DHAVE_RWEBP -DHAVE_RDDS -DINLI
 LDFLAGS  = $(MACHDEP)
 
 LIBS     = snes9x2010/snes9x2010_libretro_psl1ght.a \
-           -lrsx -lgcm_sys -lio -laudio -lsysutil -lnetctl -lnet -lsysmodule -lrt -llv2 -lm
+           -lrsx -lgcm_sys -lio -laudio -lsysfs -lsysutil -lnetctl -lnet -lsysmodule -lrt -llv2 -lm
 
 # Todo lo que haya en data/ se copia dentro del .pkg (data/USRDIR/config.txt)
 PKGFILES = data
