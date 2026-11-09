@@ -120,6 +120,15 @@ jobs:
           sed -i 's/^          //' data/USRDIR/config.txt
           cat data/USRDIR/config.txt
 
+      - name: Diagnostico sysFs
+        run: |
+          echo "=== cabeceras del SDK"
+          grep -rniE "fs(stat|opendir|readdir|closedir)" "$PS3DEV/ppu/include" | head -40 || true
+          echo "=== simbolos en librerias del SDK"
+          for l in "$PS3DEV"/ppu/lib/*.a; do nm -A "$l" 2>/dev/null | grep -iE "fs(stat|opendir|readdir|closedir)" | head -10; done || true
+          echo "=== uso en vfs_implementation.c"
+          grep -nE "sysFs|sysLv2Fs|__PSL1GHT__|sys/file" snes9x2010/libretro/libretro-common/vfs/vfs_implementation.c | head -40 || true
+
       - name: Compilar SilverSky
         run: |
           set +e
