@@ -1,5 +1,5 @@
 /*
- * SilverSky v0.1 - emulador de SNES con netplay 2 vs 2 para PS3
+ * SilverSky v0.2 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
  *   PSL1GHT + nucleo libretro Snes9x 2010
  *
  * Se construye sobre la estructura de red de NesNet (copia: NesNet no se toca):
@@ -77,9 +77,12 @@ int closesocket(int s);      /* definida en libnet, pero sin prototipo en las ca
 #define MODE_JOIN      2
 #define MODE_ROM       3      /* v1.7: opcion "ELEGIR ROM" del menu (no es un modo de juego) */
 #define MODE_OPT       5      /* v1.8.2: opcion "OPCIONES" del menu (pantalla y mandos; no es un modo de juego) */
+#define MODE_HOST1     6      /* v0.2: CREAR SALA 1 VS 1 (host = mando 1) */
+#define MODE_JOIN1     7      /* v0.2: UNIRSE A SALA 1 VS 1 (el que se une = mando 2) */
 
 /* Version del protocolo de SilverSky. NesNet usa 3 y 4: si alguien mezcla programas, el saludo se rechaza. */
 #define PROTO_VER4     0x5301
+#define PROTO_VER2     0x5302   /* v0.2: 1 vs 1 (un 2 vs 2 y un 1 vs 1 se rechazan entre si en el saludo) */
 
 /* v1.7: selector de ROMs. Las ROMs van en USRDIR/roms/ y se reconocen por su cabecera, no por el nombre */
 #define ROM_MAX        256
@@ -142,6 +145,8 @@ static int      g_menu_sel;               /* v1.7: opcion marcada del menu princ
 
 static uint32_t g_fb[SCR_W * SCR_H];      /* lienzo ARGB */
 static uint16_t g_pad[5];                 /* entrada SNES que ve el nucleo (puerto 0 + hasta 4 del multitap) */
+static int      g_one;                    /* v0.2: 1 = partida ONLINE 1 vs 1 (1 mando por consola, 2 mandos normales) */
+static int      g_proto = PROTO_VER4;     /* protocolo del saludo: PROTO_VER4 (2 vs 2) o PROTO_VER2 (1 vs 1) */
 static int      g_four;                   /* 1 = partida 2 vs 2 (multitap en el puerto 2), 0 = SOLO con 2 mandos normales */
 static unsigned g_pixfmt = RETRO_PIXEL_FORMAT_RGB565;
 static uint32_t g_frame_crc;
@@ -2134,7 +2139,7 @@ static int handshake_host4(int *outD)
 
     r = net_recv(&m, 10000);
     if (r <= 0 || m.type != M_HELLO) { g_err = "EL AMIGO NO RESPONDIO"; return 0; }
-    if (m.frame != PROTO_VER4) {
+    if (m.frame != (uint32_t)g_proto) {
         memset(&m, 0, sizeof m); m.type = M_REJECT; m.v1 = 1; net_send(&m);
         g_err = "AMIGO EN OTRO MODO O VERSION DISTINTA"; return 0;
     }
@@ -2142,7 +2147,7 @@ static int handshake_host4(int *outD)
         memset(&m, 0, sizeof m); m.type = M_REJECT; m.v1 = 2; net_send(&m);
         g_err = "ROM DISTINTA A LA DEL AMIGO"; return 0;
     }
-    memset(&m, 0, sizeof m); m.type = M_HELLO; m.frame = PROTO_VER4; m.v1 = g_romcrc;
+    memset(&m, 0, sizeof m); m.type = M_HELLO; m.frame = (uint32_t)g_proto; m.v1 = g_romcrc;
     if (!net_send(&m)) { g_err = "SE CORTO LA CONEXION"; return 0; }
 
     for (i = 0; i < 5; i++) {
@@ -2171,7 +2176,7 @@ static int handshake_client4(int *outD)
     int r, D = 0, haveD = 0;
     uint32_t t0;
 
-    memset(&m, 0, sizeof m); m.type = M_HELLO; m.frame = PROTO_VER4; m.v1 = g_romcrc;
+    memset(&m, 0, sizeof m); m.type = M_HELLO; m.frame = (uint32_t)g_proto; m.v1 = g_romcrc;
     if (!net_send(&m)) { g_err = "SE CORTO LA CONEXION"; return 0; }
     r = net_recv(&m, 10000);
     if (r <= 0) { g_err = "EL HOST NO RESPONDIO"; return 0; }
@@ -2522,8 +2527,13 @@ static int session_loop(int role, int D, uint32_t maxframes)
                 uint32_t mine = loc[frame % RING], theirs = rem[frame % RING];
                 uint32_t hb = (role == 0) ? mine : theirs;      /* mandos del host */
                 uint32_t cb = (role == 0) ? theirs : mine;      /* mandos del que se une */
-                p1 = (uint16_t)(hb & 0xFFFF); p2 = (uint16_t)(hb >> 16);
-                p3 = (uint16_t)(cb & 0xFFFF); p4 = (uint16_t)(cb >> 16);
+                if (g_one) {                                    /* v0.2: 1 vs 1: host = mando 1 (puerto 1), el que se une = mando 2 (puerto 2) */
+                    p1 = (uint16_t)(hb & 0xFFFF); p2 = (uint16_t)(cb & 0xFFFF);
+                    p3 = p4 = 0;
+                } else {
+                    p1 = (uint16_t)(hb & 0xFFFF); p2 = (uint16_t)(hb >> 16);
+                    p3 = (uint16_t)(cb & 0xFFFF); p4 = (uint16_t)(cb >> 16);
+                }
             }
         }
 
@@ -2549,8 +2559,8 @@ static int session_loop(int role, int D, uint32_t maxframes)
 
         if (role >= 0 && netinfo_show(frame)) {
             if (g_desyncs) snprintf(ov, sizeof ov, "DESYNC EN FRAME %u", (unsigned)g_first_desync);
-            else if (g_netinfo == 1) snprintf(ov, sizeof ov, "2V2 %s DELAY %d (%dMS) FPS %u TRABAS %u", role == 0 ? "P1+P2" : "P3+P4", D, D * 17, (unsigned)g_ni_fps, (unsigned)g_ni_st);
-            else snprintf(ov, sizeof ov, "SILVERSKY 2V2  %s  DELAY %d", role == 0 ? "P1+P2" : "P3+P4", D);
+            else if (g_netinfo == 1) snprintf(ov, sizeof ov, "%s %s DELAY %d (%dMS) FPS %u TRABAS %u", g_one ? "1V1" : "2V2", g_one ? (role == 0 ? "P1" : "P2") : (role == 0 ? "P1+P2" : "P3+P4"), D, D * 17, (unsigned)g_ni_fps, (unsigned)g_ni_st);
+            else snprintf(ov, sizeof ov, "SILVERSKY %s  %s  DELAY %d", g_one ? "1V1" : "2V2", g_one ? (role == 0 ? "P1" : "P2") : (role == 0 ? "P1+P2" : "P3+P4"), D);
             ui_text(2, 2, ov, 1, g_desyncs ? 0xFFFF4040 : 0xFFFFFFFF);
         }
         if (g_toast_n > 0) { ui_text(4, 224, g_toast, 1, 0xFFFFFF40); g_toast_n--; }
@@ -2595,7 +2605,7 @@ out:
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
     ui_clear();
-    ui_center(20, "SILVERSKY V0.1", 2, 0xFFFFD040);
+    ui_center(20, "SILVERSKY V0.2", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -2855,8 +2865,9 @@ static void ui_options(void)
 
 static int ui_menu(void)
 {
-    static const char *items[5] = { "ELEGIR ROM", "SOLO - 2 MANDOS", "CREAR SALA 2 VS 2 (HOST)", "UNIRSE A SALA 2 VS 2", "OPCIONES" };
-    static const int modes[5] = { MODE_ROM, MODE_SOLO, MODE_HOST, MODE_JOIN, MODE_OPT };   /* mismo orden que items */
+    static const char *items[7] = { "ELEGIR ROM", "SOLO - 2 MANDOS", "CREAR SALA 1 VS 1 (HOST)", "UNIRSE A SALA 1 VS 1",
+                                    "CREAR SALA 2 VS 2 (HOST)", "UNIRSE A SALA 2 VS 2", "OPCIONES" };
+    static const int modes[7] = { MODE_ROM, MODE_SOLO, MODE_HOST1, MODE_JOIN1, MODE_HOST, MODE_JOIN, MODE_OPT };   /* mismo orden que items */
     int i;
     g_stage = "menu";
     ui_prime();
@@ -2865,15 +2876,15 @@ static int ui_menu(void)
         char l[80], nm[48];
         pump();
         e = ui_edges();
-        if (e & UI_UP)   g_menu_sel = (g_menu_sel + 4) % 5;
-        if (e & UI_DOWN) g_menu_sel = (g_menu_sel + 1) % 5;
+        if (e & UI_UP)   g_menu_sel = (g_menu_sel + 6) % 7;
+        if (e & UI_DOWN) g_menu_sel = (g_menu_sel + 1) % 7;
         if (e & (UI_OK | UI_START)) {
             /* sin ROM elegida el juego queda en stand-by: solo se puede entrar a ELEGIR ROM y a OPCIONES */
             if (modes[g_menu_sel] != MODE_ROM && modes[g_menu_sel] != MODE_OPT && !g_rom) ui_message("PRIMERO ELIGE UNA ROM", "OPCION: ELEGIR ROM", 120);
             else return modes[g_menu_sel];
         }
         ui_clear();
-        ui_center(20, "SILVERSKY V0.1", 2, 0xFFFFD040);
+        ui_center(20, "SILVERSKY V0.2", 2, 0xFFFFD040);
         ui_center(46, "SNES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         if (g_rom) {
             fit_name(nm, sizeof nm, g_rom_name, 34);
@@ -2882,15 +2893,15 @@ static int ui_menu(void)
         } else {
             ui_center(66, "ROM: NINGUNA (ELIGE UNA)", 1, 0xFFFFC040);
         }
-        for (i = 0; i < 5; i++) {
+        for (i = 0; i < 7; i++) {
             char line[40];
             uint32_t col = i == g_menu_sel ? 0xFFFFFFFF : 0xFF8080A0;
             if (!g_rom && modes[i] != MODE_ROM && modes[i] != MODE_OPT) col = i == g_menu_sel ? 0xFFA0A0B0 : 0xFF505068;   /* bloqueadas sin ROM */
             snprintf(line, sizeof line, "%s %s", i == g_menu_sel ? ">" : " ", items[i]);
-            ui_center(90 + i * 17, line, 1, col);
+            ui_center(84 + i * 14, line, 1, col);
         }
-        ui_center(182, "2 VS 2: HOST = MANDOS 1 Y 2", 1, 0xFF80FF80);
-        ui_center(194, "EL QUE SE UNE = MANDOS 3 Y 4", 1, 0xFF80FF80);
+        ui_center(184, "1 VS 1: HOST = MANDO 1 / SE UNE = 2", 1, 0xFF80FF80);
+        ui_center(197, "2 VS 2: HOST = 1 Y 2 / SE UNE = 3 Y 4", 1, 0xFF80FF80);
         ui_center(214, "EN PARTIDA: R2 = MENU", 1, 0xFF8080A0);
         present();
 #ifdef NESNET_HOST
@@ -2922,7 +2933,7 @@ static int ui_enter_code(char *out)
             return 1;
         }
         ui_clear();
-        ui_center(20, "SILVERSKY V0.1", 2, 0xFFFFD040);
+        ui_center(20, "SILVERSKY V0.2", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 10; i++) {
             char c[2] = { (char)('0' + d[i]), 0 };
@@ -2960,6 +2971,13 @@ static void net_close(void)
 static int run_online4(int is_host, int D)
 {
     int ok;
+    if (g_one) {                                      /* v0.2: 1 vs 1 = mismos 2 mandos normales que SOLO */
+        if (!core_load()) return 0;
+        ok = session_loop(is_host ? 0 : 1, D, g_maxframes);
+        core_unload();
+        net_close();
+        return ok;
+    }
     g_four = 1;
     if (!core_load4()) { g_four = 0; return 0; }
     ok = session_loop(is_host ? 0 : 1, D, g_maxframes);
@@ -3003,7 +3021,7 @@ static int run_host4_inner(void)
               "probable CGNAT o doble NAT, desde afuera no se llega al puerto", IP4(up.public_ip), IP4(ip));
     }
     code_encode(ip, g_cfg.port, code);
-    logf_("sala 2 vs 2 creada: ip=%u.%u.%u.%u puerto=%d codigo=%s", IP4(ip), g_cfg.port, code);
+    logf_("sala %s creada: ip=%u.%u.%u.%u puerto=%d codigo=%s", g_one ? "1 vs 1" : "2 vs 2", IP4(ip), g_cfg.port, code);
 
     lfd = tcp_listen(g_cfg.port);
     if (lfd < 0) { g_err = "NO PUDE ABRIR EL PUERTO"; return 0; }
@@ -3025,8 +3043,8 @@ static int run_host4_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "SILVERSKY V0.1", 2, 0xFFFFD040);
-        ui_center(64, "SALA 2 VS 2 - TU CODIGO:", 1, 0xFFFFFFFF);
+        ui_center(20, "SILVERSKY V0.2", 2, 0xFFFFD040);
+        ui_center(64, g_one ? "SALA 1 VS 1 - TU CODIGO:" : "SALA 2 VS 2 - TU CODIGO:", 1, 0xFFFFFFFF);
         { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
         ui_center(136, l2, 1, 0xFFC0C0FF);
@@ -3130,7 +3148,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.1 - dir=%s", g_dir);
+    logf_("SilverSky v0.2 - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
@@ -3173,9 +3191,15 @@ static int app_main(const char *argv0)
             continue;
         }
         if (!g_rom) { choice = -1; continue; }             /* seguridad: sin ROM no se arranca nada */
-        logf_("modo elegido: %s", choice == MODE_SOLO ? "SOLO (2 mandos)" : choice == MODE_HOST ? "CREAR SALA 2 VS 2 (host, mandos 1-2)" : "UNIRSE 2 VS 2 (mandos 3-4)");
+        logf_("modo elegido: %s", choice == MODE_SOLO ? "SOLO (2 mandos)" : choice == MODE_HOST1 ? "CREAR SALA 1 VS 1 (host, mando 1)" :
+              choice == MODE_JOIN1 ? "UNIRSE 1 VS 1 (mando 2)" : choice == MODE_HOST ? "CREAR SALA 2 VS 2 (host, mandos 1-2)" : "UNIRSE 2 VS 2 (mandos 3-4)");
         g_err = "";
         if (choice == MODE_SOLO) ok = run_solo();
+        else if (choice == MODE_HOST1 || choice == MODE_JOIN1) {      /* v0.2: 1 vs 1 (protocolo propio; el 2 vs 2 no se toca) */
+            g_one = 1; g_proto = PROTO_VER2;
+            ok = choice == MODE_HOST1 ? run_host4() : run_client4();
+            g_one = 0; g_proto = PROTO_VER4;
+        }
         else if (choice == MODE_HOST) ok = run_host4();
         else ok = run_client4();
         choice = -1;
@@ -3249,7 +3273,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "SOLO - 2 MANDOS", "CREAR SALA 2 VS 2 (HOST)", "UNIRSE A SALA 2 VS 2" };
         int i;
         ui_clear();
-        ui_center(20, "SILVERSKY V0.1", 2, 0xFFFFD040);
+        ui_center(20, "SILVERSKY V0.2", 2, 0xFFFFD040);
         ui_center(46, "SNES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -3261,7 +3285,7 @@ int main(int argc, char **argv)
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             ui_clear();
-            ui_center(20, "SILVERSKY V0.1", 2, 0xFFFFD040);
+            ui_center(20, "SILVERSKY V0.2", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
