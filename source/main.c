@@ -1,5 +1,5 @@
 /*
- * SilverSky v0.2.1 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
+ * SilverSky v0.2.2 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
  *   PSL1GHT + nucleo libretro Snes9x 2010
  *
  * Se construye sobre la estructura de red de NesNet (copia: NesNet no se toca):
@@ -150,6 +150,8 @@ static int      g_proto = PROTO_VER4;     /* protocolo del saludo: PROTO_VER4 (2
 static int      g_four;                   /* 1 = partida 2 vs 2 (multitap en el puerto 2), 0 = SOLO con 2 mandos normales */
 static unsigned g_pixfmt = RETRO_PIXEL_FORMAT_RGB565;
 static uint32_t g_frame_crc;
+/* v0.2.2: la suma de control de cada imagen solo sirve para detectar desincronia ONLINE; en SOLO se omite (costaba ~2,9 ms/cuadro) */
+static int g_hash_on = 1;
 static int      g_core_loaded;
 
 static int      g_net = -1;               /* socket de la partida */
@@ -1315,8 +1317,10 @@ static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch)
         }
     }
     pf_b = now_us();
-    for (y = 0; y < SCR_W * SCR_H; y++) hsh = fnv_u32(hsh, g_fb[y]);
-    g_frame_crc = hsh;
+    if (g_hash_on) {
+        for (y = 0; y < SCR_W * SCR_H; y++) hsh = fnv_u32(hsh, g_fb[y]);
+        g_frame_crc = hsh;
+    }
     pf_vcb_cur  += pf_b - pf_a;
     pf_hash_cur += now_us() - pf_b;
 }
@@ -2512,6 +2516,8 @@ static int session_loop(int role, int D, uint32_t maxframes)
 
     g_run_hash = 2166136261u; g_frames_done = 0; g_desyncs = 0; g_first_desync = NO_FRAME;
     g_stage = role == 0 ? "juego-host" : role == 1 ? "juego-cliente" : role == -1 ? "juego-solo" : "juego-ref";
+    g_hash_on = (role != -1);               /* v0.2.2: el hash por imagen solo se calcula online (o en la sesion de referencia) */
+    logf_("sesion: rol=%d hash_por_imagen=%s", role, g_hash_on ? "si" : "no (solo)");
     pf_window_reset();
 
 #define COMPARE(f) do { uint32_t _f = (f); \
@@ -3243,7 +3249,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.2.1 (medidor de rendimiento) - dir=%s", g_dir);
+    logf_("SilverSky v0.2.2 (medidor de rendimiento, sin hash en solo) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
