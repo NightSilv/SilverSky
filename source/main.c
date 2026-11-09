@@ -1,5 +1,5 @@
 /*
- * SilverSky v0.2 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
+ * SilverSky v0.2.1 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
  *   PSL1GHT + nucleo libretro Snes9x 2010
  *
  * Se construye sobre la estructura de red de NesNet (copia: NesNet no se toca):
@@ -172,6 +172,20 @@ static uint32_t now_ms(void)
 #endif
 }
 
+/* v0.2.1: reloj en microsegundos (mismo reloj que now_ms) para el medidor de rendimiento */
+static unsigned long long now_us(void)
+{
+#ifdef NESNET_PS3
+    u64 s, n;
+    sysGetCurrentTime(&s, &n);
+    return (unsigned long long)s * 1000000ULL + (unsigned long long)(n / 1000ULL);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000ULL + (unsigned long long)(ts.tv_nsec / 1000);
+#endif
+}
+
 static void sleep_ms(int ms) { usleep((useconds_t)ms * 1000); }
 
 static void logf_(const char *fmt, ...)
@@ -185,6 +199,64 @@ static void logf_(const char *fmt, ...)
 #ifdef NESNET_HOST
     fprintf(stderr, "%s\n", buf);
 #endif
+}
+
+/* ------------------------------------------------------------------ */
+/* v0.2.1: medidor de rendimiento. Cada ~2 s escribe en silversky.log una linea "rend:" con el tiempo medio por   */
+/* cuadro (en ms) de cada parte. Un cuadro de 60 fps dura 16,67 ms: si "trabajo" pasa de eso, la consola no llega. */
+/*   nucleo = emulacion pura (CPU/PPU/audio del SNES)   video = convertir la imagen del nucleo a 32 bits            */
+/*   hash   = suma de control de la imagen (solo sirve para detectar desincronia online)                           */
+/*   dibujo = copiar/escalar a la pantalla (sin contar la espera del vsync)   audio = remuestreo y envio al anillo  */
+/*   red    = tiempo esperando al otro jugador (solo online)   espera = tiempo libre esperando el vsync           */
+/*   max    = el cuadro mas pesado de la ventana   lentos = cuadros con trabajo > 16,7 ms (de los medidos)         */
+/* ------------------------------------------------------------------ */
+static unsigned long long pf_run_cur, pf_vcb_cur, pf_hash_cur, pf_draw_cur, pf_wait_cur, pf_pump_cur, pf_net_cur;
+static unsigned long long pf_run_s, pf_vcb_s, pf_hash_s, pf_draw_s, pf_wait_s, pf_pump_s, pf_net_s, pf_work_s, pf_max, pf_t0;
+static unsigned pf_n, pf_slow;
+
+static void pf_cur_reset(void)
+{
+    pf_run_cur = pf_vcb_cur = pf_hash_cur = pf_draw_cur = pf_wait_cur = pf_pump_cur = pf_net_cur = 0;
+}
+
+static void pf_window_reset(void)
+{
+    pf_run_s = pf_vcb_s = pf_hash_s = pf_draw_s = pf_wait_s = pf_pump_s = pf_net_s = pf_work_s = pf_max = 0;
+    pf_n = pf_slow = 0;
+    pf_t0 = now_us();
+    pf_cur_reset();
+}
+
+#define PF_MS(x)  (unsigned)((x) / 1000ULL), (unsigned)(((x) % 1000ULL) / 10ULL)
+
+/* tf0 = now_us() al empezar el cuadro (antes de pump()); se llama justo despues de present() */
+static void pf_frame_end(unsigned long long tf0)
+{
+    unsigned long long tf1 = now_us(), tot = tf1 - tf0, idle = pf_wait_cur + pf_net_cur, work, core, draw;
+    work = tot > idle ? tot - idle : 0;
+    core = pf_run_cur > pf_vcb_cur + pf_hash_cur ? pf_run_cur - pf_vcb_cur - pf_hash_cur : 0;
+    draw = pf_draw_cur > pf_wait_cur ? pf_draw_cur - pf_wait_cur : 0;
+    (void)core;
+    pf_run_s += pf_run_cur; pf_vcb_s += pf_vcb_cur; pf_hash_s += pf_hash_cur;
+    pf_draw_s += draw; pf_wait_s += pf_wait_cur; pf_pump_s += pf_pump_cur; pf_net_s += pf_net_cur;
+    pf_work_s += work;
+    if (work > pf_max) pf_max = work;
+    if (work > 16700ULL) pf_slow++;
+    pf_n++;
+    pf_cur_reset();
+    if (!pf_t0) pf_t0 = tf0;
+    if (tf1 - pf_t0 >= 2000000ULL && pf_n > 0) {
+        unsigned long long n = pf_n, el = tf1 - pf_t0;
+        unsigned long long a_run = pf_run_s / n, a_vcb = pf_vcb_s / n, a_hash = pf_hash_s / n;
+        unsigned long long a_core = a_run > a_vcb + a_hash ? a_run - a_vcb - a_hash : 0;
+        unsigned long long a_draw = pf_draw_s / n, a_pump = pf_pump_s / n, a_wait = pf_wait_s / n, a_net = pf_net_s / n;
+        unsigned long long a_work = pf_work_s / n;
+        logf_("rend: fps=%u trabajo=%u.%02u [nucleo=%u.%02u video=%u.%02u hash=%u.%02u dibujo=%u.%02u audio=%u.%02u] red=%u.%02u espera=%u.%02u max=%u.%02u lentos=%u/%u",
+              (unsigned)((n * 1000000ULL + el / 2) / el),
+              PF_MS(a_work), PF_MS(a_core), PF_MS(a_vcb), PF_MS(a_hash), PF_MS(a_draw), PF_MS(a_pump),
+              PF_MS(a_net), PF_MS(a_wait), PF_MS(pf_max), pf_slow, (unsigned)n);
+        pf_window_reset();
+    }
 }
 
 static uint32_t crc32_buf(const uint8_t *d, size_t n)
@@ -886,11 +958,13 @@ static void gpu_flip(void)
 {
     if (!g_first) {
         int guard = 0;
+        unsigned long long pf_a = now_us();
         while (gcmGetFlipStatus() != 0) {
             usleep(200);
             if ((++guard & 0xFF) == 0) pump();
             if (guard > 15000) { logf_("AVISO: el flip no termino en 3 s"); break; }
         }
+        pf_wait_cur += now_us() - pf_a;
         gcmResetFlipStatus();
     } else {
         gcmResetFlipStatus();
@@ -915,7 +989,9 @@ static void gpu_blit_canvas(void)
         static unsigned cpu_frame[2];     /* un contador por buffer de pantalla (v1.4) */
         if (!g_first) {
             int guard = 0;
+            unsigned long long pf_a = now_us();
             while (gcmGetFlipStatus() != 0 && guard++ < 15000) usleep(200);
+            pf_wait_cur += now_us() - pf_a;
         }
         g_stage = "cpu-copia";
         /* v1.3: cada 4 cuadros DE CADA BUFFER se limpia lo que queda fuera del juego (bordes) para que no se quede el
@@ -987,11 +1063,13 @@ static void gpu_blit_canvas(void)
 
 static void present(void)
 {
+    unsigned long long pf_a = now_us();
     gpu_blit_canvas();
     g_stage = "gpu-flip";
     gpu_flip();
     g_stage = "ok";
     heartbeat();
+    pf_draw_cur += now_us() - pf_a;       /* incluye la espera del vsync; pf_frame_end la descuenta */
 }
 
 static void sysutil_cb(u64 status, u64 param, void *usrdata)
@@ -1209,7 +1287,9 @@ static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch)
 {
     unsigned x, y, ox, oy, sx = 1, sy = 1, ow, oh;
     uint32_t hsh = 2166136261u;
+    unsigned long long pf_a, pf_b;
     if (!data) return;                      /* frame repetido: no hay cambios */
+    pf_a = now_us();
     if (w >= 400) sx = 2;                   /* alta resolucion (512 columnas): se toma 1 de cada 2 */
     if (h >= 400) sy = 2;                   /* entrelazado (448 lineas): se toma 1 de cada 2 */
     ow = w / sx; oh = h / sy;
@@ -1234,8 +1314,11 @@ static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch)
             dst[x] = px;
         }
     }
+    pf_b = now_us();
     for (y = 0; y < SCR_W * SCR_H; y++) hsh = fnv_u32(hsh, g_fb[y]);
     g_frame_crc = hsh;
+    pf_vcb_cur  += pf_b - pf_a;
+    pf_hash_cur += now_us() - pf_b;
 }
 
 static void audio_cb(int16_t l, int16_t r) { int16_t s2[2]; s2[0] = l; s2[1] = r; au_push(s2, 1); }
@@ -1618,7 +1701,11 @@ static void step_frame4(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4)
     g_pad[2] = p3;
     g_pad[3] = p4;
     g_pad[4] = 0;
-    retro_run();
+    {
+        unsigned long long pf_a = now_us();
+        retro_run();
+        pf_run_cur += now_us() - pf_a;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -2425,6 +2512,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
 
     g_run_hash = 2166136261u; g_frames_done = 0; g_desyncs = 0; g_first_desync = NO_FRAME;
     g_stage = role == 0 ? "juego-host" : role == 1 ? "juego-cliente" : role == -1 ? "juego-solo" : "juego-ref";
+    pf_window_reset();
 
 #define COMPARE(f) do { uint32_t _f = (f); \
         if (mine_f[_f % RING] == _f && rem_f[_f % RING] == _f && \
@@ -2437,7 +2525,10 @@ static int session_loop(int role, int D, uint32_t maxframes)
 
     while (g_running && (maxframes == 0 || frame < maxframes)) {
         uint16_t p1, p2, p3, p4;
+        unsigned long long tf0 = now_us(), tfp;
         pump();
+        tfp = now_us();
+        pf_pump_cur = tfp - tf0;
 
         /* R2 del mando 1 de esta consola abre el menu: SOLO = continuar / guardar y cargar estado / reiniciar / salir;
          * online = continuar / reiniciar / salir (reiniciar y salir valen para los dos). Se mira antes de mandar la
@@ -2468,6 +2559,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
                 toast(tb);
             }
             last_rx = now_ms();
+            pf_cur_reset(); tf0 = now_us();       /* el tiempo con el menu abierto no cuenta */
         }
 
         if (role == -1) {
@@ -2488,6 +2580,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
             Msg m;
             uint32_t tgt = frame + (uint32_t)D;
             uint32_t bits = local_bits_pair(role, frame);
+            unsigned long long tn0 = now_us();
             loc[tgt % RING] = bits;
 
             memset(&m, 0, sizeof m);
@@ -2522,6 +2615,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
                     peer_quit = 1; peer_gone = 1;
                 }
             }
+            pf_net_cur = now_us() - tn0;
             have[frame % RING] = 0;
             {
                 uint32_t mine = loc[frame % RING], theirs = rem[frame % RING];
@@ -2565,6 +2659,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
         }
         if (g_toast_n > 0) { ui_text(4, 224, g_toast, 1, 0xFFFFFF40); g_toast_n--; }
         present();
+        pf_frame_end(tf0);
         if (role >= 0 && g_netinfo == 1) netinfo_tick();
         frame++;
         g_frames_done = frame;
@@ -3148,7 +3243,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.2 - dir=%s", g_dir);
+    logf_("SilverSky v0.2.1 (medidor de rendimiento) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
