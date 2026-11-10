@@ -1,5 +1,5 @@
 /*
- * SilverSky v0.2.4 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
+ * SilverSky v0.2.5 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
  *   PSL1GHT + nucleo libretro Snes9x 2010
  *
  * Se construye sobre la estructura de red de NesNet (copia: NesNet no se toca):
@@ -214,7 +214,44 @@ static void logf_(const char *fmt, ...)
 /* ------------------------------------------------------------------ */
 static unsigned long long pf_run_cur, pf_vcb_cur, pf_hash_cur, pf_draw_cur, pf_wait_cur, pf_pump_cur, pf_net_cur;
 static unsigned long long pf_run_s, pf_vcb_s, pf_hash_s, pf_draw_s, pf_wait_s, pf_pump_s, pf_net_s, pf_work_s, pf_max, pf_t0;
-static unsigned pf_n, pf_slow;
+static unsigned pf_n, pf_slow, pf_skip;
+
+/* ------------------------------------------------------------------ */
+/* v0.2.5: salto de dibujo cuando va atrasado (SOLO y online).                                                      */
+/* Si el cuadro actual (emulacion + lo que ya se llevaba) mas el dibujo estimado haria pasar el atraso acumulado de  */
+/* SK_TOL, este cuadro NO se dibuja ni se manda a pantalla (la imagen anterior se queda un cuadro mas); el juego, el */
+/* audio, los mandos y la red siguen exactamente igual. Nunca se saltan mas de SK_MAX_RUN cuadros seguidos. Solo     */
+/* depende de tiempos: no toca el estado de la emulacion ni los mensajes de red.                                    */
+/* ------------------------------------------------------------------ */
+#define SK_FRAME_US  16667ULL      /* un cuadro a 60 Hz */
+#define SK_TOL_US    3000ULL       /* atraso tolerado antes de empezar a saltar dibujos */
+#define SK_LAG_MAX   20000ULL      /* tope del atraso acumulado (si la emulacion sola no llega, no crece sin fin) */
+#define SK_MAX_RUN   2             /* como maximo 2 cuadros seguidos sin dibujar */
+/* sk_lag = atraso acumulado respecto a un cuadro cada 16,67 ms (negativo = adelantado, hasta -SK_TOL_US) */
+static long long sk_lag;
+static unsigned long long sk_draw_est = 4000;
+static unsigned sk_run;
+static int sk_on = 1;              /* 0 = nunca saltar (solo pruebas de PC: NESNET_NOSKIP) */
+
+static void sk_reset(void) { sk_lag = 0; sk_run = 0; }
+
+/* partial = tiempo de trabajo de este cuadro hasta ahora (emulacion, hash, audio), sin esperas de red ni de vsync */
+static int sk_should_skip(unsigned long long partial)
+{
+    if (!sk_on || sk_run >= SK_MAX_RUN) return 0;
+    return sk_lag + (long long)partial + (long long)sk_draw_est > (long long)(SK_FRAME_US + SK_TOL_US);
+}
+
+/* work = trabajo total del cuadro (sin esperas); drew = tiempo medido del dibujo (0 si se salto) */
+static void sk_account(unsigned long long work, unsigned long long drew, int skipped)
+{
+    long long lag = sk_lag + (long long)work - (long long)SK_FRAME_US;
+    if (lag < -(long long)SK_TOL_US) lag = -(long long)SK_TOL_US;
+    if (lag > (long long)SK_LAG_MAX) lag = (long long)SK_LAG_MAX;
+    sk_lag = lag;
+    if (skipped) { sk_run++; pf_skip++; }
+    else { sk_run = 0; sk_draw_est = (sk_draw_est * 3 + drew) / 4; }
+}
 
 static void pf_cur_reset(void)
 {
@@ -224,7 +261,7 @@ static void pf_cur_reset(void)
 static void pf_window_reset(void)
 {
     pf_run_s = pf_vcb_s = pf_hash_s = pf_draw_s = pf_wait_s = pf_pump_s = pf_net_s = pf_work_s = pf_max = 0;
-    pf_n = pf_slow = 0;
+    pf_n = pf_slow = pf_skip = 0;
     pf_t0 = now_us();
     pf_cur_reset();
 }
@@ -253,10 +290,10 @@ static void pf_frame_end(unsigned long long tf0)
         unsigned long long a_core = a_run > a_vcb + a_hash ? a_run - a_vcb - a_hash : 0;
         unsigned long long a_draw = pf_draw_s / n, a_pump = pf_pump_s / n, a_wait = pf_wait_s / n, a_net = pf_net_s / n;
         unsigned long long a_work = pf_work_s / n;
-        logf_("rend: fps=%u trabajo=%u.%02u [nucleo=%u.%02u video=%u.%02u hash=%u.%02u dibujo=%u.%02u audio=%u.%02u] red=%u.%02u espera=%u.%02u max=%u.%02u lentos=%u/%u",
+        logf_("rend: fps=%u trabajo=%u.%02u [nucleo=%u.%02u video=%u.%02u hash=%u.%02u dibujo=%u.%02u audio=%u.%02u] red=%u.%02u espera=%u.%02u max=%u.%02u lentos=%u/%u saltos=%u",
               (unsigned)((n * 1000000ULL + el / 2) / el),
               PF_MS(a_work), PF_MS(a_core), PF_MS(a_vcb), PF_MS(a_hash), PF_MS(a_draw), PF_MS(a_pump),
-              PF_MS(a_net), PF_MS(a_wait), PF_MS(pf_max), pf_slow, (unsigned)n);
+              PF_MS(a_net), PF_MS(a_wait), PF_MS(pf_max), pf_slow, (unsigned)n, pf_skip);
         pf_window_reset();
     }
 }
@@ -462,16 +499,9 @@ static void au_close(void) {}
 
 /* AUDIO-GENERIC-BEGIN */
 static int      g_volume = 100;        /* v1.9: volumen 0..100 (100 = igual que siempre) */
-static int      g_au_stretch = 1;      /* v0.2.3: 1 = si la emulacion se atrasa, el audio se estira (baja el tono) en vez de cortarse; 0 = como en v0.2.2 */
-/* v0.2.4: el estiramiento usa el RITMO MEDIDO: cuanto audio entrega realmente el nucleo por segundo respecto al nominal (1.0 = tiempo real).
- * La v0.2.3 solo reaccionaba al nivel de la cola y se reiniciaba con cada corte, por eso casi no frenaba (paso ~0,97 con 53 fps). */
-static double   g_au_rate_r = 1.0;
-static uint32_t g_au_in_total, g_au_win_in, g_au_win_t;
-static int      g_au_win_gap;
 static void au_reset(void)
 {
     g_aq_head = 0; g_aq_cnt = 0; g_aq_pos = 0.0;
-    g_au_rate_r = 1.0; g_au_win_t = 0; g_au_win_gap = 0;
 }
 
 /* Recibe PCM del nucleo (se llama desde retro_run) */
@@ -479,12 +509,7 @@ static void au_push(const int16_t *d, size_t frames)
 {
     size_t i;
     if (!g_au_on || !frames) return;
-    {
-        uint32_t nw = now_ms();
-        if (g_au_lastpush && (uint32_t)(nw - g_au_lastpush) > 120) g_au_win_gap = 1;    /* hubo una pausa (menu, estado): esa ventana no vale */
-        g_au_lastpush = nw;
-    }
-    g_au_in_total += (uint32_t)frames;
+    g_au_lastpush = now_ms();
     if (frames > AU_QCAP) { d += (frames - AU_QCAP) * 2; frames = AU_QCAP; }
     if (g_aq_cnt + frames > AU_QCAP) {              /* la cola se llena: descarto lo mas viejo */
         unsigned over = (unsigned)(g_aq_cnt + frames - AU_QCAP);
@@ -515,32 +540,12 @@ static double au_calc_step(void)
     double base = g_au_inrate / AU_OUT_RATE;
     double fill = (double)g_au_queued * AU_BLK + (double)g_aq_cnt / base;
     double e = (fill - AU_FILL_T) / AU_FILL_T;
-    double s, lo = 0.99;
+    double s;
     if (e > 1.0) e = 1.0; else if (e < -1.0) e = -1.0;
     s = base * (1.0 + 0.01 * e);
-    /* v0.2.4: con OPCIONES > AUDIO = ESTIRAR, si el nucleo entrega audio mas lento que el tiempo real (la emulacion no llega a
-     * 60 fps, ej. 53 fps = 0,88), la lectura se frena a ese mismo ritmo (hasta ~22 %): la cola no se vacia y no hay cortes, el
-     * sonido solo baja de tono mientras dura el tramo lento. Si va a 60 fps (r >= 0,985) no se toca nada: igual que v0.2.2. */
-    if (g_au_stretch) {
-        uint32_t nw = now_ms();
-        lo = 0.78;
-        if (g_au_win_t == 0) { g_au_win_t = nw; g_au_win_in = g_au_in_total; g_au_win_gap = 0; }
-        else if ((uint32_t)(nw - g_au_win_t) >= 250) {
-            double ri = (double)(uint32_t)(g_au_in_total - g_au_win_in) * 1000.0 / (double)(uint32_t)(nw - g_au_win_t) / g_au_inrate;
-            if (!g_au_win_gap && ri >= 0.70 && (uint32_t)(nw - g_au_lastpush) <= 45) {    /* <0,70 o sin audio reciente: es una pausa, no lentitud */
-                double dr;
-                if (ri > 1.0) ri = 1.0;
-                dr = (ri - g_au_rate_r) * (ri > g_au_rate_r ? 0.5 : 0.3);   /* sube rapido, baja con calma */
-                if (dr < -0.04) dr = -0.04;                                 /* una ventana rara (pausa que empieza) no baja el tono de golpe */
-                g_au_rate_r += dr;
-            }
-            g_au_win_t = nw; g_au_win_in = g_au_in_total; g_au_win_gap = 0;
-        }
-        if (g_au_rate_r < 0.985) s *= g_au_rate_r;
-    }
     g_au_step_s += 0.05 * (s - g_au_step_s);
     if (g_au_step_s > base * 1.01) g_au_step_s = base * 1.01;
-    if (g_au_step_s < base * lo) g_au_step_s = base * lo;
+    if (g_au_step_s < base * 0.99) g_au_step_s = base * 0.99;
     return g_au_step_s;
 }
 
@@ -624,9 +629,9 @@ static void au_pump(void)
     }
     if (!idle && (uint32_t)(now - g_au_logt) >= 2000) {
         g_au_logt = now;
-        logf_("audio: bloques=%u cortes=%u descartes=%u cola=%d entrada=%u paso=%d/10000 ritmo=%d/1000",
+        logf_("audio: bloques=%u cortes=%u descartes=%u cola=%d entrada=%u paso=%d/10000",
               (unsigned)g_au_blocks, (unsigned)g_au_under, (unsigned)g_au_drop,
-              g_au_queued, (unsigned)g_aq_cnt, (int)(step * 10000.0), (int)(g_au_rate_r * 1000.0));
+              g_au_queued, (unsigned)g_aq_cnt, (int)(step * 10000.0));
     }
 }
 /* AUDIO-GENERIC-END */
@@ -796,7 +801,6 @@ static void opts_defaults(void)
     g_screen = 0;
     g_volume = 100;
     g_netinfo = 0;
-    g_au_stretch = 1;
     g_last_rom[0] = 0;
 }
 
@@ -812,7 +816,6 @@ static void opts_save(void)
     fprintf(f, "screen=%d\n", g_screen);
     fprintf(f, "volume=%d\n", g_volume);
     fprintf(f, "netinfo=%d\n", g_netinfo);
-    fprintf(f, "stretch=%d\n", g_au_stretch);
     if (g_last_rom[0]) fprintf(f, "rom=%s\n", g_last_rom);
     fclose(f);
     remove(path);
@@ -836,8 +839,6 @@ static void opts_load(void)
             if (v0 >= 0 && v0 <= 100) g_volume = v0;
         } else if (sscanf(line, "netinfo=%d", &v0) == 1) {
             if (v0 >= 0 && v0 <= 2) g_netinfo = v0;
-        } else if (sscanf(line, "stretch=%d", &v0) == 1) {
-            if (v0 >= 0 && v0 <= 1) g_au_stretch = v0;
         } else if (!strncmp(line, "rom=", 4)) {
             size_t n = strlen(line + 4);
             while (n > 0 && (line[4 + n - 1] == '\n' || line[4 + n - 1] == '\r')) n--;
@@ -845,7 +846,7 @@ static void opts_load(void)
         }
     }
     fclose(f);
-    logf_("opciones: pantalla=%d volumen=%d info_red=%d audio_estirar=%d", g_screen, g_volume, g_netinfo, g_au_stretch);
+    logf_("opciones: pantalla=%d volumen=%d info_red=%d", g_screen, g_volume, g_netinfo);
     if (g_last_rom[0]) logf_("opciones: ultima ROM = %s", g_last_rom);
 }
 
@@ -1259,9 +1260,11 @@ static int exit_pressed(int prime, uint32_t frame) { return !prime && (frame == 
 /* Capturas de prueba: NESNET_SHOTDIR=carpeta NESNET_SHOTS=3,40,90 (numeros de present()) */
 static void dump_ppm(const char *path);
 static uint32_t g_present_n;
+static unsigned long long g_fake_draw_us;      /* prueba v0.2.5: NESNET_FAKEDRAW_MS = costo simulado del dibujo */
 static void present(void)
 {
     const char *dir = getenv("NESNET_SHOTDIR"), *lst = getenv("NESNET_SHOTS");
+    if (g_fake_draw_us) { unsigned long long t0 = now_us(); while (now_us() - t0 < g_fake_draw_us) {} pf_draw_cur += now_us() - t0; }
     heartbeat();
     g_present_n++;
     if (dir && lst) {
@@ -2555,6 +2558,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
     g_hash_on = (role != -1);               /* v0.2.2: el hash por imagen solo se calcula online (o en la sesion de referencia) */
     logf_("sesion: rol=%d hash_por_imagen=%s", role, g_hash_on ? "si" : "no (solo)");
     pf_window_reset();
+    sk_reset();
 
 #define COMPARE(f) do { uint32_t _f = (f); \
         if (mine_f[_f % RING] == _f && rem_f[_f % RING] == _f && \
@@ -2602,6 +2606,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
             }
             last_rx = now_ms();
             pf_cur_reset(); tf0 = now_us();       /* el tiempo con el menu abierto no cuenta */
+            sk_reset();
         }
 
         if (role == -1) {
@@ -2700,7 +2705,19 @@ static int session_loop(int role, int D, uint32_t maxframes)
             ui_text(2, 2, ov, 1, g_desyncs ? 0xFFFF4040 : 0xFFFFFFFF);
         }
         if (g_toast_n > 0) { ui_text(4, 224, g_toast, 1, 0xFFFFFF40); g_toast_n--; }
-        present();
+        {
+            /* v0.2.5: si va atrasado, este cuadro no se dibuja (ver sk_should_skip); todo lo demas del cuadro ya se hizo */
+            unsigned long long tn = now_us(), part = tn - tf0, tt, idle, wk, drew;
+            int skipped;
+            part = part > pf_net_cur ? part - pf_net_cur : 0;
+            skipped = sk_should_skip(part);
+            if (skipped) { g_stage = "ok"; heartbeat(); } else present();
+            tn = now_us();
+            tt = tn - tf0; idle = pf_wait_cur + pf_net_cur;
+            wk = tt > idle ? tt - idle : 0;
+            drew = pf_draw_cur > pf_wait_cur ? pf_draw_cur - pf_wait_cur : 0;
+            sk_account(wk, drew, skipped);
+        }
         pf_frame_end(tf0);
         if (role >= 0 && g_netinfo == 1) netinfo_tick();
         frame++;
@@ -2964,43 +2981,9 @@ static void ui_opt_netinfo(void)
     logf_("opciones: info de red = %d", g_netinfo);
 }
 
-/* v0.2.3: OPCIONES > AUDIO SI VA LENTO. Solo cambia que pasa con el sonido cuando la consola no llega a 60 fps; si va a 60 no hace nada. */
-static void ui_opt_stretch(void)
-{
-    static const char *names[2] = { "NORMAL (COMO ANTES)", "ESTIRAR (EL SONIDO BAJA UN POCO)" };
-    static const char *desc[2] = { "SI SE ATRASA, EL AUDIO PUEDE CORTARSE", "SI SE ATRASA, NO SE CORTA: SUENA MAS LENTO" };
-    int i;
-    g_stage = "opciones-audio-lento";
-    ui_prime();
-    while (g_running) {
-        uint16_t e;
-        pump();
-        e = ui_edges();
-        if (e & (UI_UP | UI_DOWN)) { g_au_stretch = !g_au_stretch; opts_save(); }
-        if (e & (UI_OK | UI_CANCEL | UI_START)) break;
-        ui_clear();
-        ui_center(20, "AUDIO SI VA LENTO", 2, 0xFFFFD040);
-        ui_center(46, "SOLO PASA CUANDO NO LLEGA A 60 FPS", 1, 0xFFC0C0FF);
-        for (i = 0; i < 2; i++) {
-            char line[48];
-            snprintf(line, sizeof line, "%s %s", i == g_au_stretch ? ">" : " ", names[i]);
-            ui_center(84 + i * 22, line, 1, i == g_au_stretch ? 0xFFFFFFFF : 0xFF8080A0);
-        }
-        ui_center(150, desc[g_au_stretch], 1, 0xFF80FF80);
-        if (!g_cfg.audio) ui_center(170, "AVISO: SONIDO APAGADO (R2 AL ABRIR)", 1, 0xFFFFC040);
-        ui_center(200, "ARRIBA/ABAJO: CAMBIAR", 1, 0xFF8080A0);
-        ui_center(214, "X / O: VOLVER", 1, 0xFF8080A0);
-        present();
-#ifdef NESNET_HOST
-        sleep_ms(16);
-#endif
-    }
-    logf_("opciones: audio estirar = %d", g_au_stretch);
-}
-
 static void ui_options(void)
 {
-    static const char *items[5] = { "PANTALLA", "SONIDO (VOLUMEN)", "INFO DE RED EN PARTIDA", "AUDIO SI VA LENTO", "VOLVER" };
+    static const char *items[4] = { "PANTALLA", "SONIDO (VOLUMEN)", "INFO DE RED EN PARTIDA", "VOLVER" };
     int sel = 0, i;
     g_stage = "opciones";
     ui_prime();
@@ -3008,20 +2991,19 @@ static void ui_options(void)
         uint16_t e;
         pump();
         e = ui_edges();
-        if (e & UI_UP)   sel = (sel + 4) % 5;
-        if (e & UI_DOWN) sel = (sel + 1) % 5;
+        if (e & UI_UP)   sel = (sel + 3) % 4;
+        if (e & UI_DOWN) sel = (sel + 1) % 4;
         if (e & UI_CANCEL) break;
         if (e & (UI_OK | UI_START)) {
             if (sel == 0) { ui_opt_screen(); ui_prime(); g_stage = "opciones"; }
             else if (sel == 1) { ui_opt_sound(); ui_prime(); g_stage = "opciones"; }
             else if (sel == 2) { ui_opt_netinfo(); ui_prime(); g_stage = "opciones"; }
-            else if (sel == 3) { ui_opt_stretch(); ui_prime(); g_stage = "opciones"; }
             else break;
         }
         ui_clear();
         ui_center(20, "OPCIONES", 2, 0xFFFFD040);
         ui_center(46, "SE GUARDAN SOLAS", 1, 0xFFC0C0FF);
-        for (i = 0; i < 5; i++) {
+        for (i = 0; i < 4; i++) {
             char line[40];
             snprintf(line, sizeof line, "%s %s", i == sel ? ">" : " ", items[i]);
             ui_center(76 + i * 20, line, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
@@ -3320,7 +3302,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.2.4 (audio estirable por ritmo medido, medidor, sin hash en solo) - dir=%s", g_dir);
+    logf_("SilverSky v0.2.5 (medidor de rendimiento, sin hash en solo, salto de dibujo si va atrasado) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
@@ -3478,6 +3460,8 @@ int main(int argc, char **argv)
     if (getenv("NESNET_R2")) g_exit_at = (uint32_t)atoi(getenv("NESNET_R2"));
     if (getenv("NESNET_R2B")) g_exit_at2 = (uint32_t)atoi(getenv("NESNET_R2B"));
     if (getenv("NESNET_NETINFO")) g_netinfo = atoi(getenv("NESNET_NETINFO"));   /* prueba: modo de info de red */
+    if (getenv("NESNET_NOSKIP")) sk_on = 0;                                     /* prueba v0.2.5: sin salto de dibujo */
+    if (getenv("NESNET_FAKEDRAW_MS")) g_fake_draw_us = (unsigned long long)atoi(getenv("NESNET_FAKEDRAW_MS")) * 1000ULL;
     if (getenv("NESNET_RESET_REF")) {                                            /* prueba v1.9.1: reinicios de la referencia "a" o "a,b" */
         const char *rr = getenv("NESNET_RESET_REF");
         g_ref_reset[0] = (uint32_t)atoi(rr);
