@@ -1,5 +1,5 @@
 /*
- * SilverSky v0.2.3 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
+ * SilverSky v0.2.4 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
  *   PSL1GHT + nucleo libretro Snes9x 2010
  *
  * Se construye sobre la estructura de red de NesNet (copia: NesNet no se toca):
@@ -463,9 +463,15 @@ static void au_close(void) {}
 /* AUDIO-GENERIC-BEGIN */
 static int      g_volume = 100;        /* v1.9: volumen 0..100 (100 = igual que siempre) */
 static int      g_au_stretch = 1;      /* v0.2.3: 1 = si la emulacion se atrasa, el audio se estira (baja el tono) en vez de cortarse; 0 = como en v0.2.2 */
+/* v0.2.4: el estiramiento usa el RITMO MEDIDO: cuanto audio entrega realmente el nucleo por segundo respecto al nominal (1.0 = tiempo real).
+ * La v0.2.3 solo reaccionaba al nivel de la cola y se reiniciaba con cada corte, por eso casi no frenaba (paso ~0,97 con 53 fps). */
+static double   g_au_rate_r = 1.0;
+static uint32_t g_au_in_total, g_au_win_in, g_au_win_t;
+static int      g_au_win_gap;
 static void au_reset(void)
 {
     g_aq_head = 0; g_aq_cnt = 0; g_aq_pos = 0.0;
+    g_au_rate_r = 1.0; g_au_win_t = 0; g_au_win_gap = 0;
 }
 
 /* Recibe PCM del nucleo (se llama desde retro_run) */
@@ -473,7 +479,12 @@ static void au_push(const int16_t *d, size_t frames)
 {
     size_t i;
     if (!g_au_on || !frames) return;
-    g_au_lastpush = now_ms();
+    {
+        uint32_t nw = now_ms();
+        if (g_au_lastpush && (uint32_t)(nw - g_au_lastpush) > 120) g_au_win_gap = 1;    /* hubo una pausa (menu, estado): esa ventana no vale */
+        g_au_lastpush = nw;
+    }
+    g_au_in_total += (uint32_t)frames;
     if (frames > AU_QCAP) { d += (frames - AU_QCAP) * 2; frames = AU_QCAP; }
     if (g_aq_cnt + frames > AU_QCAP) {              /* la cola se llena: descarto lo mas viejo */
         unsigned over = (unsigned)(g_aq_cnt + frames - AU_QCAP);
@@ -507,16 +518,25 @@ static double au_calc_step(void)
     double s, lo = 0.99;
     if (e > 1.0) e = 1.0; else if (e < -1.0) e = -1.0;
     s = base * (1.0 + 0.01 * e);
-    /* v0.2.3: con OPCIONES > AUDIO = ESTIRAR, si el audio acumulado cae mucho (la emulacion va mas lenta que el tiempo real,
-     * ej. 53 fps), la lectura se frena hasta ~22 % en vez de dejar que el anillo se vacie y suene el corte. En marcha
-     * normal (e > -0.55: en los logs sanos e ronda -0.3) no se toca nada y el paso es exactamente el de v0.2.2. */
+    /* v0.2.4: con OPCIONES > AUDIO = ESTIRAR, si el nucleo entrega audio mas lento que el tiempo real (la emulacion no llega a
+     * 60 fps, ej. 53 fps = 0,88), la lectura se frena a ese mismo ritmo (hasta ~22 %): la cola no se vacia y no hay cortes, el
+     * sonido solo baja de tono mientras dura el tramo lento. Si va a 60 fps (r >= 0,985) no se toca nada: igual que v0.2.2. */
     if (g_au_stretch) {
+        uint32_t nw = now_ms();
         lo = 0.78;
-        if (e < -0.55) {
-            double x = (e + 0.55) / 0.35;               /* 0 .. -1 */
-            if (x < -1.0) x = -1.0;
-            s *= 1.0 + 0.20 * x;
+        if (g_au_win_t == 0) { g_au_win_t = nw; g_au_win_in = g_au_in_total; g_au_win_gap = 0; }
+        else if ((uint32_t)(nw - g_au_win_t) >= 250) {
+            double ri = (double)(uint32_t)(g_au_in_total - g_au_win_in) * 1000.0 / (double)(uint32_t)(nw - g_au_win_t) / g_au_inrate;
+            if (!g_au_win_gap && ri >= 0.70 && (uint32_t)(nw - g_au_lastpush) <= 45) {    /* <0,70 o sin audio reciente: es una pausa, no lentitud */
+                double dr;
+                if (ri > 1.0) ri = 1.0;
+                dr = (ri - g_au_rate_r) * (ri > g_au_rate_r ? 0.5 : 0.3);   /* sube rapido, baja con calma */
+                if (dr < -0.04) dr = -0.04;                                 /* una ventana rara (pausa que empieza) no baja el tono de golpe */
+                g_au_rate_r += dr;
+            }
+            g_au_win_t = nw; g_au_win_in = g_au_in_total; g_au_win_gap = 0;
         }
+        if (g_au_rate_r < 0.985) s *= g_au_rate_r;
     }
     g_au_step_s += 0.05 * (s - g_au_step_s);
     if (g_au_step_s > base * 1.01) g_au_step_s = base * 1.01;
@@ -604,9 +624,9 @@ static void au_pump(void)
     }
     if (!idle && (uint32_t)(now - g_au_logt) >= 2000) {
         g_au_logt = now;
-        logf_("audio: bloques=%u cortes=%u descartes=%u cola=%d entrada=%u paso=%d/10000",
+        logf_("audio: bloques=%u cortes=%u descartes=%u cola=%d entrada=%u paso=%d/10000 ritmo=%d/1000",
               (unsigned)g_au_blocks, (unsigned)g_au_under, (unsigned)g_au_drop,
-              g_au_queued, (unsigned)g_aq_cnt, (int)(step * 10000.0));
+              g_au_queued, (unsigned)g_aq_cnt, (int)(step * 10000.0), (int)(g_au_rate_r * 1000.0));
     }
 }
 /* AUDIO-GENERIC-END */
@@ -3300,7 +3320,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.2.3 (audio estirable, medidor, sin hash en solo) - dir=%s", g_dir);
+    logf_("SilverSky v0.2.4 (audio estirable por ritmo medido, medidor, sin hash en solo) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
