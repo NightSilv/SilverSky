@@ -725,6 +725,7 @@ enum { PB_CROSS, PB_CIRCLE, PB_SQUARE, PB_TRIANGLE, PB_L1, PB_R1, PB_L2, PB_R2, 
 static int      g_screen;              /* 0 = original (pixeles cuadrados), 1 = 4:3 real, 2 = 16:9 estirada */
 static int      g_netinfo;             /* info de red en partida: 0 = solo al inicio, 1 = siempre, 2 = no */
 static char     g_last_rom[ROM_NAMELEN];   /* nombre del archivo de la ultima ROM elegida */
+static char     g_last_code[16];           /* v0.2.5.1: ultimo codigo de sala escrito al UNIRSE (10 digitos, o vacio) */
 
 /* Mapeo fijo (v0.1): X = B, CUADRADO = Y, O = A, TRIANGULO = X, L1/L2 = L, R1 = R, R2 = R (menos en el mando 1: R2 abre el
  * menu), SELECT y START. Las direcciones (cruz y palanca) ya vienen calculadas en 'dirs'. */
@@ -802,6 +803,7 @@ static void opts_defaults(void)
     g_volume = 100;
     g_netinfo = 0;
     g_last_rom[0] = 0;
+    g_last_code[0] = 0;
 }
 
 static void opts_save(void)
@@ -817,6 +819,7 @@ static void opts_save(void)
     fprintf(f, "volume=%d\n", g_volume);
     fprintf(f, "netinfo=%d\n", g_netinfo);
     if (g_last_rom[0]) fprintf(f, "rom=%s\n", g_last_rom);
+    if (g_last_code[0]) fprintf(f, "code=%s\n", g_last_code);
     fclose(f);
     remove(path);
     if (rename(tmp, path) != 0) logf_("AVISO: no pude renombrar opciones.tmp");
@@ -843,6 +846,14 @@ static void opts_load(void)
             size_t n = strlen(line + 4);
             while (n > 0 && (line[4 + n - 1] == '\n' || line[4 + n - 1] == '\r')) n--;
             if (n > 0 && n < ROM_NAMELEN && !memchr(line + 4, '/', n) && line[4] != '.') { memcpy(g_last_rom, line + 4, n); g_last_rom[n] = 0; }
+        } else if (!strncmp(line, "code=", 5)) {
+            /* v0.2.5.1: solo se acepta si son exactamente 10 digitos */
+            size_t n = strlen(line + 5), k;
+            int okc;
+            while (n > 0 && (line[5 + n - 1] == '\n' || line[5 + n - 1] == '\r')) n--;
+            okc = (n == 10);
+            for (k = 0; okc && k < n; k++) if (line[5 + k] < '0' || line[5 + k] > '9') okc = 0;
+            if (okc) { memcpy(g_last_code, line + 5, 10); g_last_code[10] = 0; }
         }
     }
     fclose(f);
@@ -3069,21 +3080,34 @@ static int ui_menu(void)
 
 static int ui_enter_code(char *out)
 {
-    int d[10], pos = 0, i;
+    int d[10], pos = 0, i, saved = 0;
     memset(d, 0, sizeof d);
+    /* v0.2.5.1: si hay un codigo guardado de la vez anterior, aparece ya escrito; se confirma con START (no se conecta solo) */
+    if (strlen(g_last_code) == 10) {
+        for (i = 0; i < 10; i++) d[i] = g_last_code[i] - '0';
+        saved = 1;
+    }
     while (g_running) {
         uint16_t e;
         char line[40];
         pump();
         e = ui_edges();
-        if (e & UI_UP)    d[pos] = (d[pos] + 1) % 10;
-        if (e & UI_DOWN)  d[pos] = (d[pos] + 9) % 10;
+        if (e & UI_UP)    { d[pos] = (d[pos] + 1) % 10; saved = 0; }
+        if (e & UI_DOWN)  { d[pos] = (d[pos] + 9) % 10; saved = 0; }
         if (e & UI_LEFT)  { if (pos > 0) pos--; }
         if (e & (UI_RIGHT | UI_OK)) { if (pos < 9) pos++; }
         if (e & UI_CANCEL) return 0;
         if (e & UI_START) {
             for (i = 0; i < 10; i++) out[i] = (char)('0' + d[i]);
             out[10] = 0;
+            {
+                uint32_t vip; int vport;
+                if (strcmp(g_last_code, out) != 0 && code_decode(out, &vip, &vport)) {   /* v0.2.5.1: lo recuerda para la proxima vez (aunque se apague la PS3); un codigo invalido no se guarda */
+                    snprintf(g_last_code, sizeof g_last_code, "%.10s", out);
+                    opts_save();
+                    logf_("codigo de sala guardado en opciones.txt");
+                }
+            }
             return 1;
         }
         ui_clear();
@@ -3097,6 +3121,7 @@ static int ui_enter_code(char *out)
         }
         snprintf(line, sizeof line, "DIGITO %d DE 10", pos + 1);
         ui_center(140, line, 1, 0xFFC0C0FF);
+        if (saved) ui_center(154, "ULTIMO CODIGO USADO (START: CONECTAR)", 1, 0xFF80FF80);
         ui_center(170, "ARRIBA/ABAJO: CAMBIAR   IZQ/DER: MOVER", 1, 0xFF8080A0);
         ui_center(184, "START: CONECTAR    O: CANCELAR", 1, 0xFF8080A0);
         present();
@@ -3302,7 +3327,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.2.5 (medidor de rendimiento, sin hash en solo, salto de dibujo si va atrasado) - dir=%s", g_dir);
+    logf_("SilverSky v0.2.5.1 (codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
