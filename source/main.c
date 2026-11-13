@@ -1,5 +1,5 @@
 /*
- * SilverSky v0.2.6 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
+ * SilverSky v0.2.7 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
  *   PSL1GHT + nucleo libretro Snes9x 2010
  *
  * Se construye sobre la estructura de red de NesNet (copia: NesNet no se toca):
@@ -81,8 +81,10 @@ int closesocket(int s);      /* definida en libnet, pero sin prototipo en las ca
 #define MODE_JOIN1     7      /* v0.2: UNIRSE A SALA 1 VS 1 (el que se une = mando 2) */
 
 /* Version del protocolo de SilverSky. NesNet usa 3 y 4: si alguien mezcla programas, el saludo se rechaza. */
-#define PROTO_VER4     0x5301
-#define PROTO_VER2     0x5302   /* v0.2: 1 vs 1 (un 2 vs 2 y un 1 vs 1 se rechazan entre si en el saludo) */
+/* v0.2.7: suben a 0x5311 / 0x5312 porque aparece el mensaje M_STATE (estado guardado del host + bloque de datos): una v0.2.6 y una
+ * v0.2.7 se rechazan en el saludo en vez de desincronizarse. */
+#define PROTO_VER4     0x5311
+#define PROTO_VER2     0x5312   /* v0.2: 1 vs 1 (un 2 vs 2 y un 1 vs 1 se rechazan entre si en el saludo) */
 
 /* v1.7: selector de ROMs. Las ROMs van en USRDIR/roms/ y se reconocen por su cabecera, no por el nombre */
 #define ROM_MAX        256
@@ -1745,6 +1747,24 @@ static int state_load(int slot)
     return ok;
 }
 
+/* v0.2.7: lee la ranura a memoria (para mandarsela al amigo en ONLINE). 1 = bien (el que llama libera *buf) */
+static int state_read(int slot, uint8_t **buf, size_t *n)
+{
+    size_t want = retro_serialize_size(), fsz = 0;
+    char path[420];
+    uint8_t *b = NULL;
+    state_path(slot, path, sizeof path);
+    if (!read_whole_file(path, &b, &fsz)) { logf_("estado: la ranura %d esta vacia", slot + 1); return 0; }
+    if (fsz != want || fsz == 0 || fsz > STATE_MAX) {
+        free(b);
+        logf_("AVISO: estado: la ranura %d tiene %u bytes y el nucleo pide %u: no la cargo", slot + 1, (unsigned)fsz, (unsigned)want);
+        return 0;
+    }
+    *buf = b;
+    *n = fsz;
+    return 1;
+}
+
 static void step_frame(uint16_t p1, uint16_t p2)
 {
     g_pad[0] = p1;
@@ -1770,7 +1790,10 @@ static void step_frame4(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4)
 /* ------------------------------------------------------------------ */
 /* Red: mensajes de 16 bytes, TCP, poll() con espera propia            */
 /* ------------------------------------------------------------------ */
-enum { M_HELLO = 1, M_PING, M_PONG, M_CFG, M_START, M_INPUT, M_QUIT, M_REJECT, M_RESET };   /* M_RESET (frame = cuadro en que ambos reinician) */
+enum { M_HELLO = 1, M_PING, M_PONG, M_CFG, M_START, M_INPUT, M_QUIT, M_REJECT, M_RESET, M_STATE };   /* M_RESET (frame = cuadro en que ambos reinician) */
+/* v0.2.7: M_STATE = el host manda un estado guardado: frame = cuadro en que los dos lo cargan, v1 = bytes, v2 = CRC32 de los datos;
+ * justo despues de este mensaje de 20 bytes vienen v1 bytes sin marco (ver net_send_raw / net_recv_raw).
+ * M_PING durante una partida es solo un "sigo aqui" (el otro lado lo ignora): se manda cada 2 s con el menu de R2 abierto. */
 
 typedef struct {
     uint8_t  type, a;
@@ -1841,6 +1864,50 @@ static int net_recv(Msg *m, int timeout_ms)
             g_rxlen += n;
         }
     }
+}
+
+/* v0.2.7: bloques grandes sin marco (estados guardados), justo despues de un mensaje M_STATE. net_recv_raw primero vacia lo que
+ * net_recv ya dejo leido en g_rx (el mensaje y los primeros bytes pueden llegar juntos). Cada espera se renueva con cada trozo
+ * recibido o enviado: se rinde solo si pasan 20 s sin avanzar nada. */
+static int net_send_raw(const uint8_t *src, size_t len)
+{
+    size_t off = 0;
+    uint32_t t0 = now_ms();
+    while (off < len) {
+        int r = fd_wait(g_net, POLLOUT, 100), n;
+        size_t chunk = len - off > 16384 ? 16384 : len - off;
+        if (r < 0) return 0;
+        if (r == 0) { if ((int)(now_ms() - t0) > 20000) return 0; continue; }
+        n = (int)send(g_net, (const char *)src + off, chunk, 0);
+        if (n <= 0) return 0;
+        off += (size_t)n;
+        t0 = now_ms();
+    }
+    return 1;
+}
+
+static int net_recv_raw(uint8_t *dst, size_t len)
+{
+    size_t got = 0;
+    uint32_t t0 = now_ms();
+    if (g_rxlen > 0) {
+        size_t k = (size_t)g_rxlen < len ? (size_t)g_rxlen : len;
+        memcpy(dst, g_rx, k);
+        memmove(g_rx, g_rx + k, (size_t)g_rxlen - k);
+        g_rxlen -= (int)k;
+        got = k;
+    }
+    while (got < len) {
+        int r = fd_wait(g_net, POLLIN, 200), n;
+        size_t want = len - got > 65536 ? 65536 : len - got;
+        if (r < 0) return 0;
+        if (r == 0) { if ((int)(now_ms() - t0) > 20000) return 0; continue; }
+        n = (int)recv(g_net, (char *)dst + got, (int)want, 0);
+        if (n <= 0) return 0;
+        got += (size_t)n;
+        t0 = now_ms();
+    }
+    return 1;
 }
 
 static void sock_nonblock(int fd, int on)
@@ -2397,15 +2464,17 @@ enum { MK_CONT, MK_SAVE, MK_LOAD, MK_RESET, MK_EXIT };
  *   ONLINE: CONTINUAR / REINICIAR EL JUEGO / SALIR DE LA PARTIDA (reiniciar y salir valen para los dos; sin estados)
  * Reiniciar, salir, cargar y sobreescribir piden confirmar con X.
  * Devuelve 0 = seguir jugando, 1 = salir, 2 = reiniciar, 10+n = guardar en la ranura n, 20+n = cargar la ranura n (n = 0..2). */
-static int solo_menu(int online)
+static int solo_menu(int online, int host_states)
 {
     int kinds[5], nk = 0, sel = 0, r = -1, confirm = -1, x, y, i;
+    int st = !online || host_states;          /* v0.2.7: online, solo el HOST ve guardar/cargar estado */
+    uint32_t ka = now_ms();
     int ex[STATE_SLOTS];
     const char *note = NULL;
     kinds[nk++] = MK_CONT;
-    if (!online) { kinds[nk++] = MK_SAVE; kinds[nk++] = MK_LOAD; }
+    if (st) { kinds[nk++] = MK_SAVE; kinds[nk++] = MK_LOAD; }
     kinds[nk++] = MK_RESET; kinds[nk++] = MK_EXIT;
-    for (i = 0; i < STATE_SLOTS; i++) ex[i] = online ? 0 : state_exists(i);
+    for (i = 0; i < STATE_SLOTS; i++) ex[i] = st ? state_exists(i) : 0;
     memcpy(g_fb_save, g_fb, sizeof g_fb);
     g_stage = "menu-solo";
     ui_prime();
@@ -2413,6 +2482,14 @@ static int solo_menu(int online)
         uint16_t e;
         int k;
         pump();
+        if (online && g_net >= 0 && (uint32_t)(now_ms() - ka) >= 2000) {
+            /* v0.2.7: con el menu abierto el otro lado esperaria mi entrada; un "sigo aqui" cada 2 s evita que se rinda a los 15 s */
+            Msg kp;
+            memset(&kp, 0, sizeof kp);
+            kp.type = M_PING;
+            net_send(&kp);
+            ka = now_ms();
+        }
         e = ui_edges();
         if (confirm >= 0) {
             if (e & UI_OK) {
@@ -2454,7 +2531,8 @@ static int solo_menu(int online)
             } else {
                 snprintf(l, sizeof l, "CARGAR LA RANURA %d?", g_state_slot + 1);
                 ui_center(88, l, 1, 0xFFFFFFFF);
-                ui_center(108, "SE PIERDE LO QUE LLEVAS", 1, 0xFFFFC040);
+                ui_center(108, online ? "SE PIERDE LO QUE LLEVAN LOS DOS" : "SE PIERDE LO QUE LLEVAS", 1, 0xFFFFC040);
+                if (online) ui_center(120, "SE ENVIA AL AMIGO (TARDA UNOS SEGUNDOS)", 1, 0xFFC0C0FF);
             }
             ui_center(136, "X: SI      O: NO", 1, 0xFFFFD040);
         } else {
@@ -2476,8 +2554,8 @@ static int solo_menu(int online)
             }
             if (note) ui_center(158, note, 1, 0xFFFFC040);
             ui_center(172, "ARRIBA/ABAJO + X   O: SEGUIR", 1, 0xFF8080A0);
-            if (online) ui_center(184, "REINICIAR Y SALIR: PARA LOS DOS", 1, 0xFF8080A0);
-            else if (kinds[sel] == MK_SAVE || kinds[sel] == MK_LOAD) ui_center(184, "IZQ/DER: CAMBIAR DE RANURA", 1, 0xFF8080A0);
+            if (kinds[sel] == MK_SAVE || kinds[sel] == MK_LOAD) ui_center(184, "IZQ/DER: CAMBIAR DE RANURA", 1, 0xFF8080A0);
+            else if (online) ui_center(184, "REINICIAR Y SALIR: PARA LOS DOS", 1, 0xFF8080A0);
         }
         present();
 #ifdef NESNET_HOST
@@ -2563,6 +2641,11 @@ static int session_loop(int role, int D, uint32_t maxframes)
     uint32_t rst[RST_MAX];
     int i, ended_ok = 1, peer_gone = 0, peer_quit = 0, user_exit = 0;
     char ov[64];
+    /* v0.2.7: estado guardado pendiente de cargar en el cuadro st_in_F (el host lo lee de su ranura; el invitado lo recibe por red) */
+    uint8_t *st_in = NULL;
+    size_t st_in_n = 0;
+    uint32_t st_in_F = NO_FRAME;
+    const char *stage0;
 
     memset(loc, 0, sizeof loc); memset(rem, 0, sizeof rem); memset(have, 0, sizeof have);
     for (i = 0; i < RING; i++) { mine_f[i] = NO_FRAME; rem_f[i] = NO_FRAME; mine_c[i] = rem_c[i] = 0; }
@@ -2571,6 +2654,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
 
     g_run_hash = 2166136261u; g_frames_done = 0; g_desyncs = 0; g_first_desync = NO_FRAME;
     g_stage = role == 0 ? "juego-host" : role == 1 ? "juego-cliente" : role == -1 ? "juego-solo" : "juego-ref";
+    stage0 = g_stage;
     g_hash_on = (role != -1);               /* v0.2.2: el hash por imagen solo se calcula online (o en la sesion de referencia) */
     g_ingame = 1;                           /* v0.2.6: desde aqui la imagen usa la pantalla elegida en OPCIONES */
     logf_("sesion: rol=%d hash_por_imagen=%s", role, g_hash_on ? "si" : "no (solo)");
@@ -2596,8 +2680,8 @@ static int session_loop(int role, int D, uint32_t maxframes)
         /* R2 del mando 1 de esta consola abre el menu: SOLO = continuar / guardar y cargar estado / reiniciar / salir;
          * online = continuar / reiniciar / salir (reiniciar y salir valen para los dos). Se mira antes de mandar la
          * entrada de este cuadro; si el menu sigue abierto, el otro lado simplemente espera como siempre. */
-        if (role != -2 && exit_pressed(0, frame)) {
-            int xr = solo_menu(role >= 0);
+        if (role != -2 && exit_pressed(0, frame) && !(st_in && st_in_F > frame)) {   /* v0.2.7: con un estado por cargarse en unos cuadros no se abre el menu */
+            int xr = solo_menu(role >= 0, role == 0);
             if (xr == 1) { user_exit = 1; logf_("salida pedida por el jugador (R2) en frame %u", (unsigned)frame); goto out; }
             if (xr == 2) {
                 if (role >= 0) {
@@ -2611,7 +2695,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
                     retro_reset();
                     logf_("juego reiniciado por el jugador (R2) en frame %u", (unsigned)frame);
                 }
-            } else if (xr >= 10 && xr < 10 + STATE_SLOTS && role == -1) {
+            } else if (xr >= 10 && xr < 10 + STATE_SLOTS && (role == -1 || role == 0)) {   /* v0.2.7: el host tambien guarda en ONLINE (solo escribe su ranura: no toca la partida) */
                 char tb[40];
                 snprintf(tb, sizeof tb, state_save(xr - 10) ? "ESTADO GUARDADO EN RANURA %d" : "NO SE PUDO GUARDAR (RANURA %d)", xr - 9);
                 toast(tb);
@@ -2620,6 +2704,29 @@ static int session_loop(int role, int D, uint32_t maxframes)
                 int lr = state_load(xr - 20);
                 snprintf(tb, sizeof tb, lr > 0 ? "ESTADO CARGADO: RANURA %d" : "NO SE PUDO CARGAR (RANURA %d)", xr - 19);
                 toast(tb);
+            } else if (xr >= 20 && xr < 20 + STATE_SLOTS && role == 0) {
+                /* v0.2.7: el host carga un estado EN ONLINE. Se lo manda al invitado (M_STATE + datos) ANTES de su entrada de este cuadro y los
+                 * dos lo cargan justo antes de emular el cuadro F = frame + D (mismo truco que el reinicio sincronizado). Mientras llegan
+                 * los datos los dos esperan (el juego se detiene unos segundos); no se pierde ni se adelanta ningun cuadro. */
+                uint8_t *sb = NULL;
+                size_t sn = 0;
+                char tb[40];
+                if (!state_read(xr - 20, &sb, &sn)) {
+                    snprintf(tb, sizeof tb, "NO SE PUDO CARGAR (RANURA %d)", xr - 19);
+                    toast(tb);
+                } else {
+                    uint32_t F = frame + (uint32_t)D, t0 = now_ms();
+                    Msg rq;
+                    memset(&rq, 0, sizeof rq);
+                    rq.type = M_STATE; rq.frame = F; rq.v1 = (uint32_t)sn; rq.v2 = crc32_buf(sb, sn);
+                    g_stage = "enviando-estado";
+                    if (!peer_gone && (!net_send(&rq) || !net_send_raw(sb, sn))) peer_gone = 1;
+                    g_stage = stage0;
+                    logf_("estado: ranura %d (%u bytes, crc %08X) enviado en %u ms; los dos lo cargan en el frame %u (pedido en el %u)",
+                          xr - 19, (unsigned)sn, (unsigned)rq.v2, (unsigned)(now_ms() - t0), (unsigned)F, (unsigned)frame);
+                    free(st_in);
+                    st_in = sb; st_in_n = sn; st_in_F = F;
+                }
             }
             last_rx = now_ms();
             pf_cur_reset(); tf0 = now_us();       /* el tiempo con el menu abierto no cuenta */
@@ -2673,6 +2780,24 @@ static int session_loop(int role, int D, uint32_t maxframes)
                     rem[m.frame % RING] = m.v3;
                     have[m.frame % RING] = 1;
                     if (m.v1 != NO_FRAME) { rem_f[m.v1 % RING] = m.v1; rem_c[m.v1 % RING] = m.v2; COMPARE(m.v1); }
+                } else if (m.type == M_STATE) {
+                    /* v0.2.7: el host manda un estado guardado: lo recibo entero y lo cargo en el cuadro m.frame (nunca se pasa de largo:
+                     * no puedo emular m.frame sin la entrada del host, que viene DESPUES de este mensaje). Si algo no cuadra, se termina
+                     * la partida con aviso: cargar el estado en un solo lado la desincronizaria. */
+                    uint8_t *sb;
+                    if (m.v1 == 0 || m.v1 > STATE_MAX || (size_t)m.v1 != retro_serialize_size() || m.frame < frame) {
+                        g_err = "ESTADO DEL HOST NO VALIDO"; ended_ok = 0; goto out;
+                    }
+                    sb = (uint8_t *)malloc(m.v1);
+                    if (!sb) { g_err = "SIN MEMORIA PARA EL ESTADO"; ended_ok = 0; goto out; }
+                    g_stage = "recibiendo-estado";
+                    if (!net_recv_raw(sb, m.v1)) { free(sb); if (!g_running) goto out; peer_gone = 1; continue; }
+                    g_stage = stage0;
+                    if (crc32_buf(sb, m.v1) != m.v2) { free(sb); g_err = "ESTADO RECIBIDO CON ERRORES"; ended_ok = 0; goto out; }
+                    free(st_in);
+                    st_in = sb; st_in_n = m.v1; st_in_F = m.frame;
+                    last_rx = now_ms();
+                    logf_("estado recibido del host: %u bytes, crc %08X; lo cargo en el frame %u (voy en el %u)", (unsigned)m.v1, (unsigned)m.v2, (unsigned)m.frame, (unsigned)frame);
                 } else if (m.type == M_RESET) {
                     rst_add(rst, m.frame);
                 } else if (m.type == M_QUIT) {
@@ -2702,6 +2827,13 @@ static int session_loop(int role, int D, uint32_t maxframes)
             if (role == -2 && (frame == g_ref_reset[0] || frame == g_ref_reset[1])) due = 1;
 #endif
             if (due) { retro_reset(); logf_("reinicio aplicado en el frame %u", (unsigned)frame); }
+        }
+        if (st_in && st_in_F == frame) {                  /* v0.2.7: estado del host (el mismo bloque en los dos lados) justo antes de este cuadro */
+            int okl = retro_unserialize(st_in, st_in_n) ? 1 : 0;
+            logf_("estado cargado en el frame %u: %u bytes, crc %08X %s", (unsigned)frame, (unsigned)st_in_n, (unsigned)crc32_buf(st_in, st_in_n), okl ? "OK" : "FALLO");
+            toast(role == 0 ? (okl ? "ESTADO CARGADO" : "NO SE PUDO CARGAR") : "EL HOST CARGO UN ESTADO");
+            free(st_in);
+            st_in = NULL; st_in_n = 0; st_in_F = NO_FRAME;
         }
 
 #ifdef NESNET_HOST
@@ -2743,6 +2875,8 @@ static int session_loop(int role, int D, uint32_t maxframes)
     }
 out:
     g_ingame = 0;                           /* v0.2.6: al salir de la partida, los menus vuelven a MENU_SCREEN */
+    free(st_in);                            /* v0.2.7: estado pendiente que nunca llego a cargarse */
+    st_in = NULL;
     if (role >= 0 && g_net >= 0) {
         Msg q; memset(&q, 0, sizeof q); q.type = M_QUIT; net_send(&q);
         if (user_exit) {
@@ -3334,7 +3468,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.2.6 (menus siempre a pantalla completa; codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
+    logf_("SilverSky v0.2.7 (estados guardados online: guarda y carga el host; menus siempre a pantalla completa; codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
