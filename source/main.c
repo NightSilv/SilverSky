@@ -1,5 +1,5 @@
 /*
- * SilverSky v0.2.5 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
+ * SilverSky v0.2.6 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
  *   PSL1GHT + nucleo libretro Snes9x 2010
  *
  * Se construye sobre la estructura de red de NesNet (copia: NesNet no se toca):
@@ -723,6 +723,11 @@ enum { PB_CROSS, PB_CIRCLE, PB_SQUARE, PB_TRIANGLE, PB_L1, PB_R1, PB_L2, PB_R2, 
 #define PB_BIT(b) (1u << (b))
 
 static int      g_screen;              /* 0 = original (pixeles cuadrados), 1 = 4:3 real, 2 = 16:9 estirada */
+/* v0.2.6: la opcion de pantalla (g_screen) es solo para la imagen del JUEGO. Todos los menus y avisos (todo lo que se dibuja
+ * fuera de una partida) se muestran siempre con MENU_SCREEN, asi no cambian de tamano al mover ORIGINAL / 4:3 / 16:9.
+ * g_ingame = 1 solo mientras corre session_loop (el menu de R2 sobre la imagen del juego cuenta como juego). */
+#define MENU_SCREEN 2                  /* 2 = 16:9 a pantalla completa (1 = 4:3 centrado, 0 = original) */
+static int      g_ingame;
 static int      g_netinfo;             /* info de red en partida: 0 = solo al inicio, 1 = siempre, 2 = no */
 static char     g_last_rom[ROM_NAMELEN];   /* nombre del archivo de la ultima ROM elegida */
 static char     g_last_code[16];           /* v0.2.5.1: ultimo codigo de sala escrito al UNIRSE (10 digitos, o vacio) */
@@ -1047,7 +1052,7 @@ static void gpu_blit_canvas(void)
         /* v1.3: cada 4 cuadros DE CADA BUFFER se limpia lo que queda fuera del juego (bordes) para que no se quede el
          * residuo del XMB (reloj / bateria del mando); el juego mismo se repinta siempre.
          * v1.8.2: el escalado (modo de pantalla elegido en OPCIONES) y esa limpieza viven en canvas_blit_cpu. */
-        canvas_blit_cpu((uint32_t *)g_cbuf[g_cur], (int)g_dw, (int)g_dh, g_screen, g_zoom, (const uint32_t *)g_fb, &cpu_frame[g_cur & 1]);
+        canvas_blit_cpu((uint32_t *)g_cbuf[g_cur], (int)g_dw, (int)g_dh, g_ingame ? g_screen : MENU_SCREEN, g_zoom, (const uint32_t *)g_fb, &cpu_frame[g_cur & 1]);
         return;
     }
 
@@ -2567,6 +2572,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
     g_run_hash = 2166136261u; g_frames_done = 0; g_desyncs = 0; g_first_desync = NO_FRAME;
     g_stage = role == 0 ? "juego-host" : role == 1 ? "juego-cliente" : role == -1 ? "juego-solo" : "juego-ref";
     g_hash_on = (role != -1);               /* v0.2.2: el hash por imagen solo se calcula online (o en la sesion de referencia) */
+    g_ingame = 1;                           /* v0.2.6: desde aqui la imagen usa la pantalla elegida en OPCIONES */
     logf_("sesion: rol=%d hash_por_imagen=%s", role, g_hash_on ? "si" : "no (solo)");
     pf_window_reset();
     sk_reset();
@@ -2736,6 +2742,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
         if (role == -1 && (frame % 300) == 0) sram_save(0);      /* guardado de bateria cada ~5 s si cambio (solo SOLO) */
     }
 out:
+    g_ingame = 0;                           /* v0.2.6: al salir de la partida, los menus vuelven a MENU_SCREEN */
     if (role >= 0 && g_net >= 0) {
         Msg q; memset(&q, 0, sizeof q); q.type = M_QUIT; net_send(&q);
         if (user_exit) {
@@ -2902,7 +2909,7 @@ static void ui_opt_screen(void)
         if (e & (UI_OK | UI_CANCEL | UI_START)) break;
         ui_clear();
         ui_center(20, "PANTALLA", 2, 0xFFFFD040);
-        ui_center(46, "LA IMAGEN CAMBIA AL MOVER EL CURSOR", 1, 0xFFC0C0FF);
+        ui_center(46, "SOLO CAMBIA LA IMAGEN DEL JUEGO", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[48];
             snprintf(line, sizeof line, "%s %s", i == g_screen ? ">" : " ", screen_names[i]);
@@ -3327,7 +3334,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.2.5.1 (codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
+    logf_("SilverSky v0.2.6 (menus siempre a pantalla completa; codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
