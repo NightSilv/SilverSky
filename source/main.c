@@ -1,5 +1,5 @@
 /*
- * SilverSky v0.2.7 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
+ * SilverSky v0.2.8 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
  *   PSL1GHT + nucleo libretro Snes9x 2010
  *
  * Se construye sobre la estructura de red de NesNet (copia: NesNet no se toca):
@@ -1677,9 +1677,9 @@ static void sram_save(int force)
 /* Archivo: USRDIR/saves/<CRC32 de la ROM>_<ranura 1..3>.sta. En online NO existen (las dos consolas tendrian que     */
 /* cargar el mismo estado a la vez y se desincronizarian).                                                         */
 /* ------------------------------------------------------------------ */
-#define STATE_SLOTS 3
+#define STATE_SLOTS 6                     /* v0.2.8: 6 ranuras (antes 3); las 1 a 3 de antes siguen siendo las mismas */
 #define STATE_MAX   0x200000
-static int  g_state_slot;                 /* ranura elegida en el menu (0..2); se recuerda mientras la app esta abierta */
+static int  g_state_slot;                 /* ranura elegida en el menu (0..STATE_SLOTS-1); se recuerda mientras la app esta abierta */
 static char g_toast[48];                  /* aviso corto sobre la imagen (guardado, cargado, error) */
 static int  g_toast_n;
 
@@ -3184,6 +3184,12 @@ static int ui_menu(void)
         e = ui_edges();
         if (e & UI_UP)   g_menu_sel = (g_menu_sel + 6) % 7;
         if (e & UI_DOWN) g_menu_sel = (g_menu_sel + 1) % 7;
+        if (e & UI_CANCEL) {
+            /* v0.2.8: O en el menu principal sale al XMB, sin confirmar (igual que la salida del sistema: g_running = 0) */
+            logf_("salida al XMB pedida con O en el menu principal");
+            g_running = 0;
+            return -1;
+        }
         if (e & (UI_OK | UI_START)) {
             /* sin ROM elegida el juego queda en stand-by: solo se puede entrar a ELEGIR ROM y a OPCIONES */
             if (modes[g_menu_sel] != MODE_ROM && modes[g_menu_sel] != MODE_OPT && !g_rom) ui_message("PRIMERO ELIGE UNA ROM", "OPCION: ELEGIR ROM", 120);
@@ -3208,7 +3214,8 @@ static int ui_menu(void)
         }
         ui_center(184, "1 VS 1: HOST = MANDO 1 / SE UNE = 2", 1, 0xFF80FF80);
         ui_center(197, "2 VS 2: HOST = 1 Y 2 / SE UNE = 3 Y 4", 1, 0xFF80FF80);
-        ui_center(214, "EN PARTIDA: R2 = MENU", 1, 0xFF8080A0);
+        ui_center(210, "EN PARTIDA: R2 = MENU", 1, 0xFF8080A0);
+        ui_center(223, "O: SALIR AL XMB", 1, 0xFF8080A0);
         present();
 #ifdef NESNET_HOST
         sleep_ms(16);
@@ -3468,7 +3475,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.2.7 (estados guardados online: guarda y carga el host; menus siempre a pantalla completa; codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
+    logf_("SilverSky v0.2.8 (6 ranuras de estado; O sale al XMB desde el menu principal; estados guardados online: guarda y carga el host; menus siempre a pantalla completa; codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
