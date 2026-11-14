@@ -1,5 +1,5 @@
 /*
- * SilverSky v0.2.8 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
+ * SilverSky v0.2.9 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
  *   PSL1GHT + nucleo libretro Snes9x 2010
  *
  * Se construye sobre la estructura de red de NesNet (copia: NesNet no se toca):
@@ -734,8 +734,8 @@ static int      g_netinfo;             /* info de red en partida: 0 = solo al in
 static char     g_last_rom[ROM_NAMELEN];   /* nombre del archivo de la ultima ROM elegida */
 static char     g_last_code[16];           /* v0.2.5.1: ultimo codigo de sala escrito al UNIRSE (10 digitos, o vacio) */
 
-/* Mapeo fijo (v0.1): X = B, CUADRADO = Y, O = A, TRIANGULO = X, L1/L2 = L, R1 = R, R2 = R (menos en el mando 1: R2 abre el
- * menu), SELECT y START. Las direcciones (cruz y palanca) ya vienen calculadas en 'dirs'. */
+/* Mapeo fijo (v0.1): X = B, CUADRADO = Y, O = A, TRIANGULO = X, L1/L2 = L, R1 = R, R2 = R (menos en el mando 1, donde R2 queda
+ * sin funcion; el menu se abre con R3), SELECT y START. Las direcciones (cruz y palanca) ya vienen calculadas en 'dirs'. */
 static uint16_t snes_bits(uint32_t btns, uint16_t dirs, int port)
 {
     uint16_t b = (uint16_t)(dirs & (NB_UP | NB_DOWN | NB_LEFT | NB_RIGHT));
@@ -1227,13 +1227,13 @@ static uint16_t ui_edges(void)
     return e;
 }
 
-/* v1.7: R2 abre el menu de salir (R2 del mando 1 queda reservado para el menu). prime=1 solo memoriza el estado actual,
- * para ignorar un R2 que siga apretado al empezar la partida (se aprieta R2 al abrir para quitar el audio). */
+/* v0.2.9: R3 (clic de la palanca izquierda) abre el menu en partida (antes R2: un dedo que se escapaba abria el menu y frenaba la
+ * partida online). prime=1 solo memoriza el estado actual, para ignorar un R3 que siga apretado al empezar la partida. */
 static int exit_pressed(int prime, uint32_t frame)
 {
     static int prev;
     padData *d = pad_read(0);
-    int now = d->BTN_R2 ? 1 : 0;
+    int now = d->BTN_R3 ? 1 : 0;
     int e = now && !prev;
     (void)frame;
     prev = now;
@@ -2677,7 +2677,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
         tfp = now_us();
         pf_pump_cur = tfp - tf0;
 
-        /* R2 del mando 1 de esta consola abre el menu: SOLO = continuar / guardar y cargar estado / reiniciar / salir;
+        /* R3 del mando 1 de esta consola abre el menu: SOLO = continuar / guardar y cargar estado / reiniciar / salir;
          * online = continuar / reiniciar / salir (reiniciar y salir valen para los dos). Se mira antes de mandar la
          * entrada de este cuadro; si el menu sigue abierto, el otro lado simplemente espera como siempre. */
         if (role != -2 && exit_pressed(0, frame) && !(st_in && st_in_F > frame)) {   /* v0.2.7: con un estado por cargarse en unos cuadros no se abre el menu */
@@ -3214,7 +3214,7 @@ static int ui_menu(void)
         }
         ui_center(184, "1 VS 1: HOST = MANDO 1 / SE UNE = 2", 1, 0xFF80FF80);
         ui_center(197, "2 VS 2: HOST = 1 Y 2 / SE UNE = 3 Y 4", 1, 0xFF80FF80);
-        ui_center(210, "EN PARTIDA: R2 = MENU", 1, 0xFF8080A0);
+        ui_center(210, "EN PARTIDA: R3 = MENU", 1, 0xFF8080A0);
         ui_center(223, "O: SALIR AL XMB", 1, 0xFF8080A0);
         present();
 #ifdef NESNET_HOST
@@ -3475,7 +3475,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.2.8 (6 ranuras de estado; O sale al XMB desde el menu principal; estados guardados online: guarda y carga el host; menus siempre a pantalla completa; codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
+    logf_("SilverSky v0.2.9 (menu en partida con R3; 6 ranuras de estado; O sale al XMB desde el menu principal; estados guardados online: guarda y carga el host; menus siempre a pantalla completa; codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
