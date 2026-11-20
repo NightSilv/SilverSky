@@ -1,5 +1,5 @@
 /*
- * SilverSky v0.3.0 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
+ * SilverSky v0.3.1 - emulador de SNES con netplay 1 vs 1 y 2 vs 2 para PS3
  *   PSL1GHT + nucleo libretro Snes9x 2010
  *
  * Se construye sobre la estructura de red de NesNet (copia: NesNet no se toca):
@@ -2464,14 +2464,15 @@ static void hr_btns(const HrBtn *b, int n, const char *hint)
         } else {
             hr_disc(x, 676, 17, HC_WHITE);
             hr_disc(x, 676, 15, b[i].kind == 0 ? HC_BX : HC_BO);
-            hr_text(HF_BTN, x, 676, b[i].kind == 0 ? "X" : "O", HC_WHITE, "cm", 0);
+            if (b[i].kind == 0) { hr_line(x - 6, 670, x + 6, 682, 3, HC_WHITE); hr_line(x - 6, 682, x + 6, 670, 3, HC_WHITE); }   /* X */
+            else hr_ring(x, 676, 8, 3, HC_WHITE);                                                                              /* O redonda */
             tx = x + 28;
         }
         hr_text(HF_OM16, tx, 676, b[i].label, HC_SIL, "lm", 0);
         x = tx + hr_tw(HF_OM16, b[i].label, 0) + 70;
     }
     if (hint && hint[0]) hr_text(HF_MS13, x, 676, hint, HC_DIM, "lm", 0);
-    hr_text(HF_OM14, 1160, 676, "V0.3.0", HC_DIM, "rm", 0);
+    hr_text(HF_OM14, 1160, 676, "V0.3.1", HC_DIM, "rm", 0);
 }
 
 /* encabezado de las pantallas internas: titulo grande con subrayado celeste, subtitulo y marca arriba a la derecha */
@@ -3560,6 +3561,7 @@ static void roms_scan(void)
     g_nroms = 0;
     snprintf(dir, sizeof dir, "%s/roms", g_dir);
     mkdir(dir, 0777);                    /* si no existe, la crea para que se sepa donde van las ROMs */
+    { char cdir[420]; snprintf(cdir, sizeof cdir, "%s/covers", g_dir); mkdir(cdir, 0777); }   /* v0.3.1: tambien la de caratulas */
     d = opendir(dir);
     if (!d) { logf_("roms: no pude abrir %s (errno=%d)", dir, errno); return; }
     while ((e = readdir(d)) != NULL && g_nroms < ROM_MAX) {
@@ -5384,7 +5386,12 @@ static void hr_cov_scan(void)
     g_cov_n = 0;
     snprintf(path, sizeof path, "%s/covers", g_dir);
     d = opendir(path);
-    if (!d) { logf_("covers: no existe %s (opcional)", path); return; }
+    if (!d) {
+        mkdir(path, 0777);                   /* la crea para que se sepa donde van las caratulas (como en NesNet) */
+        d = opendir(path);
+        if (!d) { logf_("covers: no existe %s y no pude crearla", path); return; }
+        logf_("covers: carpeta creada: %s", path);
+    }
     while ((e = readdir(d)) != NULL && g_cov_n < HR_COVMAX) {
         size_t n = strlen(e->d_name);
         if (n > 4 && n < sizeof g_cov_names[0] && hr_ieq(e->d_name + n - 4, ".png")) { memcpy(g_cov_names[g_cov_n], e->d_name, n + 1); g_cov_n++; }
@@ -5487,7 +5494,7 @@ static void hr_show_draw(const char *l1, const char *l2, const char *l3)
     if (l1) { hr_fit(HF_OB19, l1, 540, t, sizeof t); hr_text(HF_OB19, 640, 322, t, HC_CY, "cm", 0); }
     if (l2) { hr_fit(HF_MS17, l2, 540, t, sizeof t); hr_text(HF_MS17, 640, 380, t, HC_TXT, "cm", 0); }
     if (l3) { hr_fit(HF_MS15, l3, 540, t, sizeof t); hr_text(HF_MS15, 640, 424, t, HC_DIM, "cm", 0); }
-    hr_text(HF_OM14, 1160, 676, "V0.3.0", HC_DIM, "rm", 0);
+    hr_text(HF_OM14, 1160, 676, "V0.3.1", HC_DIM, "rm", 0);
 }
 
 static void hr_menu_draw(int sel, int has_rom, const char *rom_name)
@@ -6428,7 +6435,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.3.0 (menus nuevos a 1280x720 con caratulas en covers/; menu en partida con R3; 6 ranuras de estado; O sale al XMB desde el menu principal; estados guardados online: guarda y carga el host; menus siempre a pantalla completa; codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
+    logf_("SilverSky v0.3.1 (menus nuevos a 1280x720 con caratulas en covers/; menu en partida con R3; 6 ranuras de estado; O sale al XMB desde el menu principal; estados guardados online: guarda y carga el host; menus siempre a pantalla completa; codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
