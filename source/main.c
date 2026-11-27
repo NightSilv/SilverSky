@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <ctype.h>
 
 #include "libretro.h"
 
@@ -2472,7 +2473,7 @@ static void hr_btns(const HrBtn *b, int n, const char *hint)
         x = tx + hr_tw(HF_OM16, b[i].label, 0) + 70;
     }
     if (hint && hint[0]) hr_text(HF_MS13, x, 676, hint, HC_DIM, "lm", 0);
-    hr_text(HF_OM14, 1160, 676, "V0.3.1", HC_DIM, "rm", 0);
+    hr_text(HF_OM14, 1160, 676, "V0.3.2", HC_DIM, "rm", 0);
 }
 
 /* encabezado de las pantallas internas: titulo grande con subrayado celeste, subtitulo y marca arriba a la derecha */
@@ -3519,6 +3520,92 @@ static int read_whole_file(const char *path, uint8_t **buf, size_t *size)
     return 1;
 }
 
+static int hr_inflate_raw(const uint8_t *src, size_t n, uint8_t *out, size_t cap, size_t *outn);   /* definido mas abajo (lector de PNG) */
+
+/* ---- v0.3.2: ROMs dentro de un .zip (igual que Katari v0.2.1). Se usa la primera entrada .sfc / .smc / .swc / .fig
+ * (sin cifrar, guardada o deflate). El CRC con el que se emparejan las dos consolas es el de la ROM de dentro, asi que un
+ * .zip y la misma ROM suelta se reconocen como el mismo juego (y comparten saves y estados). ---- */
+#define ZIP_MAX_FILE  (9u * 1024u * 1024u)
+#define ZIP_MAX_ROM   (8u * 1024u * 1024u + 512u)
+static uint32_t zp_u16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
+static uint32_t zp_u32(const uint8_t *p) { return zp_u16(p) | (zp_u16(p + 2) << 16); }
+static int zp_rom_ext(const char *n, size_t len)
+{
+    char e[4];
+    int i;
+    if (len < 5 || n[len - 4] != '.') return 0;
+    for (i = 0; i < 3; i++) e[i] = (char)tolower((unsigned char)n[len - 3 + i]);
+    e[3] = 0;
+    return !strcmp(e, "sfc") || !strcmp(e, "smc") || !strcmp(e, "swc") || !strcmp(e, "fig");
+}
+/* busca la entrada de la ROM; devuelve 1 y deja la posicion de sus datos, tamanos, metodo y CRC32 */
+static int zip_find(const uint8_t *z, size_t n, size_t *dpos, size_t *csize, size_t *usize, int *method, uint32_t *crc, char *inner, size_t icap)
+{
+    size_t i, lo, cdo, p;
+    uint32_t cnt, k;
+    if (n < 22) return 0;
+    lo = n > 65557 ? n - 65557 : 0;
+    for (i = n - 22 + 1; i-- > lo; ) if (zp_u32(z + i) == 0x06054b50u) break;
+    if (i + 1 == lo || zp_u32(z + i) != 0x06054b50u) return 0;
+    cnt = zp_u16(z + i + 10); cdo = zp_u32(z + i + 16);
+    p = cdo;
+    for (k = 0; k < cnt; k++) {
+        uint32_t flags, meth, comp, unc, nl, el, cl, lho, c32;
+        size_t ldn, lde;
+        if (p + 46 > n || zp_u32(z + p) != 0x02014b50u) return 0;
+        flags = zp_u16(z + p + 8); meth = zp_u16(z + p + 10); c32 = zp_u32(z + p + 16);
+        comp = zp_u32(z + p + 20); unc = zp_u32(z + p + 24);
+        nl = zp_u16(z + p + 28); el = zp_u16(z + p + 30); cl = zp_u16(z + p + 32); lho = zp_u32(z + p + 42);
+        if (p + 46 + nl > n) return 0;
+        if (!(flags & 1) && (meth == 0 || meth == 8) && unc >= 32u * 1024u && unc <= ZIP_MAX_ROM &&
+            zp_rom_ext((const char *)z + p + 46, nl) && (!inner || nl < icap)) {
+            if ((size_t)lho + 30 > n || zp_u32(z + lho) != 0x04034b50u) return 0;
+            ldn = zp_u16(z + lho + 26); lde = zp_u16(z + lho + 28);
+            *dpos = (size_t)lho + 30 + ldn + lde;
+            if (*dpos > n || comp > n - *dpos) return 0;
+            *csize = comp; *usize = unc; *method = (int)meth; *crc = c32;
+            if (inner) {
+                const char *nm = (const char *)z + p + 46;
+                size_t b = nl;
+                while (b > 0 && nm[b - 1] != '/' && nm[b - 1] != '\\') b--;
+                memcpy(inner, nm + b, nl - b); inner[nl - b] = 0;
+            }
+            return 1;
+        }
+        p += 46 + nl + el + cl;
+    }
+    return 0;
+}
+static int path_is_zip(const char *path)
+{
+    size_t n = strlen(path);
+    return n > 4 && path[n - 4] == '.' && tolower((unsigned char)path[n - 3]) == 'z' && tolower((unsigned char)path[n - 2]) == 'i' && tolower((unsigned char)path[n - 1]) == 'p';
+}
+/* lee una ROM: archivo normal o la ROM de dentro de un .zip. inner (opcional) recibe el nombre del archivo de dentro. */
+static int read_rom_file(const char *path, uint8_t **buf, size_t *size, char *inner, size_t icap)
+{
+    uint8_t *z = NULL, *out;
+    size_t zn = 0, dpos, cs, us, got = 0;
+    int meth, ok = 0;
+    uint32_t c32;
+    char nm[300];
+    if (inner && icap) inner[0] = 0;
+    if (!path_is_zip(path)) return read_whole_file(path, buf, size);
+    if (!read_whole_file(path, &z, &zn)) return 0;
+    if (zn > ZIP_MAX_FILE || !zip_find(z, zn, &dpos, &cs, &us, &meth, &c32, nm, sizeof nm)) { free(z); logf_("zip: %s no trae una ROM de SNES valida", path); return 0; }
+    out = (uint8_t *)malloc(us);
+    if (out) {
+        if (meth == 0) { if (cs == us) { memcpy(out, z + dpos, us); ok = 1; } }
+        else ok = hr_inflate_raw(z + dpos, cs, out, us, &got) && got == us;
+        if (ok && crc32_buf(out, us) != c32) { ok = 0; logf_("zip: CRC de %s no coincide (zip danado)", nm); }
+    }
+    free(z);
+    if (!ok) { free(out); logf_("zip: no pude descomprimir %s", path); return 0; }
+    *buf = out; *size = us;
+    if (inner && icap) snprintf(inner, icap, "%s", nm);
+    return 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Selector de ROMs (v1.7): USRDIR/roms/, reconocidas por su cabecera  */
 /* ------------------------------------------------------------------ */
@@ -3548,6 +3635,7 @@ static int is_snes_file(const char *path)
     struct stat st;
     const char *dot = strrchr(path, '.');
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
+    if (path_is_zip(path)) return st.st_size >= 100 && (unsigned long long)st.st_size <= ZIP_MAX_FILE;   /* v0.3.2: .zip con una ROM dentro */
     if (st.st_size < 32 * 1024 || st.st_size > 8 * 1024 * 1024 + 512) return 0;
     if (!dot) return 0;
     return !name_cmp(dot, ".SFC") || !name_cmp(dot, ".SMC") || !name_cmp(dot, ".SWC") || !name_cmp(dot, ".FIG");
@@ -3575,6 +3663,17 @@ static void roms_scan(void)
             g_roms[g_nroms].size = stat(path, &st) == 0 ? (uint32_t)st.st_size : 0;
             g_roms[g_nroms].crc = 0;
             g_roms[g_nroms].has_crc = 0;
+            if (path_is_zip(path)) {              /* v0.3.2: el tamano que se muestra es el de la ROM de dentro */
+                uint8_t *zb = NULL;
+                size_t zn = 0, dp, cs, us;
+                int me, okz = 0;
+                uint32_t c32;
+                if (read_whole_file(path, &zb, &zn)) {
+                    if (zip_find(zb, zn, &dp, &cs, &us, &me, &c32, NULL, 0)) { g_roms[g_nroms].size = (uint32_t)us; okz = 1; }
+                    free(zb);
+                }
+                if (!okz) { logf_("roms: %s no trae una ROM de SNES dentro: no se lista", e->d_name); continue; }
+            }
         }
         g_nroms++;
     }
@@ -3616,9 +3715,10 @@ static int rom_load(int idx)
     char path[420];
     uint8_t *buf = NULL;
     size_t sz = 0;
+    char inner[300];
     g_rom_why = "";
     snprintf(path, sizeof path, "%s/roms/%s", g_dir, g_roms[idx].name);
-    if (!read_whole_file(path, &buf, &sz)) { logf_("roms: no pude leer %s", path); return 0; }
+    if (!read_rom_file(path, &buf, &sz, inner, sizeof inner)) { logf_("roms: no pude leer %s", path); if (path_is_zip(path)) g_rom_why = "NO PUDE ABRIR EL .ZIP"; return 0; }
     if (snes_is_superfx(buf, sz)) {
         free(buf);
         g_rom_why = "JUEGO CON CHIP SUPER FX: NO SOPORTADO";
@@ -3629,7 +3729,8 @@ static int rom_load(int idx)
     g_rom = buf;
     g_romsz = sz;
     g_romcrc = snes_crc(g_rom, g_romsz);
-    snprintf(g_cfg.rom, sizeof g_cfg.rom, "%s", path);
+    if (inner[0]) { snprintf(g_cfg.rom, sizeof g_cfg.rom, "%s/roms/%s", g_dir, inner); logf_("roms: ROM dentro del zip: %s", inner); }
+    else snprintf(g_cfg.rom, sizeof g_cfg.rom, "%s", path);
     snprintf(g_rom_name, sizeof g_rom_name, "%s", g_roms[idx].name);
     logf_("ROM elegida: %s  %u bytes  crc32=%08X", g_rom_name, (unsigned)g_romsz, (unsigned)g_romcrc);
     return 1;
@@ -4656,7 +4757,26 @@ static void hr_solo_draw(const int *kinds, int nk, int sel, int confirm, int onl
  *   ONLINE: CONTINUAR / REINICIAR EL JUEGO / SALIR DE LA PARTIDA (reiniciar y salir valen para los dos; sin estados)
  * Reiniciar, salir, cargar y sobreescribir piden confirmar con X.
  * Devuelve 0 = seguir jugando, 1 = salir, 2 = reiniciar, 10+n = guardar en la ranura n, 20+n = cargar la ranura n (n = 0..2). */
+/* v0.3.2: al cerrar el menu R3 (p. ej. la X de "si, cargar estado"), los BOTONES que sigan apretados no llegan al juego hasta
+ * soltarlos (si no, el personaje salta al volver). Las flechas no se bloquean. Es solo entrada local: la red no cambia. */
+static uint16_t g_swallow[2];
+static int      g_swallow_arm;             /* bit 0 = mando 1, bit 1 = mando 2: armar en la proxima lectura */
+static uint16_t swallow_filter(int port, uint16_t b)
+{
+    int p = port ? 1 : 0;
+    if (g_swallow_arm & (1 << p)) { g_swallow[p] = (uint16_t)(b & ~(NB_UP | NB_DOWN | NB_LEFT | NB_RIGHT)); g_swallow_arm &= ~(1 << p); }
+    g_swallow[p] &= b;
+    return (uint16_t)(b & ~g_swallow[p]);
+}
+
+static int solo_menu_inner(int online, int host_states);
 static int solo_menu(int online, int host_states)
+{
+    int r = solo_menu_inner(online, host_states);
+    g_swallow_arm = 3;                      /* v0.3.2: al cerrar el menu, los botones que sigan apretados no llegan al juego */
+    return r;
+}
+static int solo_menu_inner(int online, int host_states)
 {
     int kinds[5], nk = 0, sel = 0, r = -1, confirm = -1, x, y, i;
     int st = !online || host_states;          /* v0.2.7: online, solo el HOST ve guardar/cargar estado */
@@ -4820,10 +4940,10 @@ static uint32_t local_bits_pair(int role, uint32_t frame)
 {
 #ifdef NESNET_HOST
     int base = role == 1 ? 2 : 0;           /* pruebas: host = jugadores 0 y 1, cliente = jugadores 2 y 3 */
-    return (uint32_t)script_input(base, frame) | ((uint32_t)script_input(base + 1, frame) << 16);
+    return (uint32_t)swallow_filter(0, script_input(base, frame)) | ((uint32_t)swallow_filter(1, script_input(base + 1, frame)) << 16);
 #else
     (void)role; (void)frame;
-    return (uint32_t)pad_nes_bits(0) | ((uint32_t)pad_nes_bits(1) << 16);
+    return (uint32_t)swallow_filter(0, pad_nes_bits(0)) | ((uint32_t)swallow_filter(1, pad_nes_bits(1)) << 16);
 #endif
 }
 
@@ -5183,12 +5303,17 @@ static int hr_inf_codes(HrInf *z, const HrHuf *lc, const HrHuf *dc)
 /* zlib: 1 = bien (z->on bytes escritos) */
 static int hr_inflate(const uint8_t *src, size_t n, uint8_t *out, size_t cap, size_t *outn)
 {
+    if (n < 2 || (src[0] & 15) != 8 || ((src[0] << 8) | src[1]) % 31 != 0 || (src[1] & 32)) return 0;
+    return hr_inflate_raw(src + 2, n - 2, out, cap, outn);
+}
+/* v0.3.2: deflate "crudo" (sin la cabecera zlib): lo usan el PNG (via hr_inflate) y las ROMs en .zip. 1 = bien */
+static int hr_inflate_raw(const uint8_t *src, size_t n, uint8_t *out, size_t cap, size_t *outn)
+{
     HrInf z;
     static HrHuf lc, dc;
     int last;
     memset(&z, 0, sizeof z);
-    if (n < 2 || (src[0] & 15) != 8 || ((src[0] << 8) | src[1]) % 31 != 0 || (src[1] & 32)) return 0;
-    z.s = src + 2; z.n = n - 2; z.o = out; z.oc = cap;
+    z.s = src; z.n = n; z.o = out; z.oc = cap;
     do {
         int type;
         last = hr_inf_bits(&z, 1);
@@ -5494,7 +5619,7 @@ static void hr_show_draw(const char *l1, const char *l2, const char *l3)
     if (l1) { hr_fit(HF_OB19, l1, 540, t, sizeof t); hr_text(HF_OB19, 640, 322, t, HC_CY, "cm", 0); }
     if (l2) { hr_fit(HF_MS17, l2, 540, t, sizeof t); hr_text(HF_MS17, 640, 380, t, HC_TXT, "cm", 0); }
     if (l3) { hr_fit(HF_MS15, l3, 540, t, sizeof t); hr_text(HF_MS15, 640, 424, t, HC_DIM, "cm", 0); }
-    hr_text(HF_OM14, 1160, 676, "V0.3.1", HC_DIM, "rm", 0);
+    hr_text(HF_OM14, 1160, 676, "V0.3.2", HC_DIM, "rm", 0);
 }
 
 static void hr_menu_draw(int sel, int has_rom, const char *rom_name)
@@ -5601,7 +5726,7 @@ static void hr_rom_draw(int sel, int top, int vis)
         hr_card(260, 190, 760, 280, 28, 0);
         hr_text(HF_OB19, 640, 268, "NO HAY ROMS EN LA CARPETA", HC_WHITE, "cm", 0);
         hr_text(HF_OB17, 640, 322, "SILV00001/USRDIR/roms", HC_CY, "cm", 0);
-        hr_text(HF_MS17, 640, 380, "Pon ahí tus ROMs (.sfc o .smc) y vuelve a entrar.", HC_TXT, "cm", 0);
+        hr_text(HF_MS17, 640, 380, "Pon ahí tus ROMs (.sfc, .smc o .zip) y vuelve a entrar.", HC_TXT, "cm", 0);
         hr_btns(bt, 1, NULL);
         return;
     }
@@ -5751,7 +5876,7 @@ static int ui_rom_select_hr(void)
                     size_t bs = 0;
                     char rp[420];
                     snprintf(rp, sizeof rp, "%s/roms/%s", g_dir, g_roms[sel].name);
-                    if (read_whole_file(rp, &b, &bs)) { g_roms[sel].crc = snes_crc(b, bs); g_roms[sel].has_crc = 1; free(b); }
+                    if (read_rom_file(rp, &b, &bs, NULL, 0)) { g_roms[sel].crc = snes_crc(b, bs); g_roms[sel].has_crc = 1; free(b); }
                 }
                 hr_cov_load(g_roms[sel].name);       /* la caratula se carga cuando el cursor se queda quieto (no al pasar rapido) */
             }
@@ -5932,7 +6057,7 @@ static int ui_rom_select(void)
                 size_t bs = 0;
                 char rp[420];
                 snprintf(rp, sizeof rp, "%s/roms/%s", g_dir, g_roms[sel].name);
-                if (read_whole_file(rp, &b, &bs)) { g_roms[sel].crc = snes_crc(b, bs); g_roms[sel].has_crc = 1; free(b); }
+                if (read_rom_file(rp, &b, &bs, NULL, 0)) { g_roms[sel].crc = snes_crc(b, bs); g_roms[sel].has_crc = 1; free(b); }
             }
         }
         ui_clear();
@@ -6435,7 +6560,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.3.1 (menus nuevos a 1280x720 con caratulas en covers/; menu en partida con R3; 6 ranuras de estado; O sale al XMB desde el menu principal; estados guardados online: guarda y carga el host; menus siempre a pantalla completa; codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
+    logf_("SilverSky v0.3.2 (ROMs en .zip; al cerrar el menu R3 los botones apretados no llegan al juego; menus nuevos a 1280x720 con caratulas en covers/; menu en partida con R3; 6 ranuras de estado; O sale al XMB desde el menu principal; estados guardados online: guarda y carga el host; menus siempre a pantalla completa; codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
