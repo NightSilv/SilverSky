@@ -84,8 +84,9 @@ int closesocket(int s);      /* definida en libnet, pero sin prototipo en las ca
 /* Version del protocolo de SilverSky. NesNet usa 3 y 4: si alguien mezcla programas, el saludo se rechaza. */
 /* v0.2.7: suben a 0x5311 / 0x5312 porque aparece el mensaje M_STATE (estado guardado del host + bloque de datos): una v0.2.6 y una
  * v0.2.7 se rechazan en el saludo en vez de desincronizarse. */
-#define PROTO_VER4     0x5311
-#define PROTO_VER2     0x5312   /* v0.2: 1 vs 1 (un 2 vs 2 y un 1 vs 1 se rechazan entre si en el saludo) */
+/* v0.3.3: suben a 0x5321 / 0x5322 porque la huella (hash) de la imagen cambia: una v0.3.2 y una v0.3.3 se rechazan en el saludo */
+#define PROTO_VER4     0x5321
+#define PROTO_VER2     0x5322   /* v0.2: 1 vs 1 (un 2 vs 2 y un 1 vs 1 se rechazan entre si en el saludo) */
 
 /* v1.7: selector de ROMs. Las ROMs van en USRDIR/roms/ y se reconocen por su cabecera, no por el nombre */
 #define ROM_MAX        256
@@ -155,6 +156,7 @@ static unsigned g_pixfmt = RETRO_PIXEL_FORMAT_RGB565;
 static uint32_t g_frame_crc;
 /* v0.2.2: la suma de control de cada imagen solo sirve para detectar desincronia ONLINE; en SOLO se omite (costaba ~2,9 ms/cuadro) */
 static int g_hash_on = 1;
+static int g_hash_now = 1;              /* v0.3.3: online la huella se calcula solo 1 de cada 4 cuadros (en los otros vale 0 en las dos PS3) */
 static int      g_core_loaded;
 
 static int      g_net = -1;               /* socket de la partida */
@@ -2473,7 +2475,7 @@ static void hr_btns(const HrBtn *b, int n, const char *hint)
         x = tx + hr_tw(HF_OM16, b[i].label, 0) + 70;
     }
     if (hint && hint[0]) hr_text(HF_MS13, x, 676, hint, HC_DIM, "lm", 0);
-    hr_text(HF_OM14, 1160, 676, "V0.3.2", HC_DIM, "rm", 0);
+    hr_text(HF_OM14, 1160, 676, "V0.3.3", HC_DIM, "rm", 0);
 }
 
 /* encabezado de las pantallas internas: titulo grande con subrayado celeste, subtitulo y marca arriba a la derecha */
@@ -3484,9 +3486,18 @@ static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch)
         }
     }
     pf_b = now_us();
-    if (g_hash_on) {
-        for (y = 0; y < SCR_W * SCR_H; y++) hsh = fnv_u32(hsh, g_fb[y]);
-        g_frame_crc = hsh;
+    if (g_hash_on && g_hash_now) {
+        /* v0.3.3: huella rapida: la imagen completa, un pixel entero por paso (antes 4 pasos por pixel) y en 4 carriles
+         * independientes para que el procesador no espere cada multiplicacion. Cuesta unas 4-8 veces menos que la de antes. */
+        uint32_t h0 = hsh, h1 = 0x9E3779B9u, h2 = 0x85EBCA6Bu, h3 = 0xC2B2AE35u;
+        const uint32_t *fp = g_fb;
+        for (y = 0; y < SCR_W * SCR_H; y += 4) {
+            h0 = (h0 ^ fp[y])     * 16777619u;
+            h1 = (h1 ^ fp[y + 1]) * 16777619u;
+            h2 = (h2 ^ fp[y + 2]) * 16777619u;
+            h3 = (h3 ^ fp[y + 3]) * 16777619u;
+        }
+        g_frame_crc = fnv_u32(fnv_u32(fnv_u32(h0, h1), h2), h3);
     }
     pf_vcb_cur  += pf_b - pf_a;
     pf_hash_cur += now_us() - pf_b;
@@ -5156,8 +5167,13 @@ static int session_loop(int role, int D, uint32_t maxframes)
 #ifdef NESNET_HOST
         { const char *b = getenv("NESNET_BREAK");        /* prueba: corrompe a proposito un cuadro */
           if (b && role == 1 && frame >= (uint32_t)atoi(b) && frame < (uint32_t)atoi(b) + 30) p3 ^= 0xFFF; }
+        { const char *b = getenv("NESNET_BREAK1");       /* v0.3.3 prueba: igual pero en el mando 1 (la ROM de prueba solo lee ese) */
+          if (b && role == 1 && frame >= (uint32_t)atoi(b) && frame < (uint32_t)atoi(b) + (getenv("NESNET_BREAKN") ? (uint32_t)atoi(getenv("NESNET_BREAKN")) : 1u)) p1 ^= 0x0F0; }
 #endif
+        g_hash_now = (frame & 3) == 0;      /* v0.3.3: huella 1 de cada 4 cuadros (las dos PS3 igual) */
+        if (!g_hash_now) g_frame_crc = 0;
         step_frame4(p1, p2, p3, p4);
+        g_hash_now = 1;
 
         mine_f[frame % RING] = frame;
         mine_c[frame % RING] = g_frame_crc;
@@ -5619,7 +5635,7 @@ static void hr_show_draw(const char *l1, const char *l2, const char *l3)
     if (l1) { hr_fit(HF_OB19, l1, 540, t, sizeof t); hr_text(HF_OB19, 640, 322, t, HC_CY, "cm", 0); }
     if (l2) { hr_fit(HF_MS17, l2, 540, t, sizeof t); hr_text(HF_MS17, 640, 380, t, HC_TXT, "cm", 0); }
     if (l3) { hr_fit(HF_MS15, l3, 540, t, sizeof t); hr_text(HF_MS15, 640, 424, t, HC_DIM, "cm", 0); }
-    hr_text(HF_OM14, 1160, 676, "V0.3.2", HC_DIM, "rm", 0);
+    hr_text(HF_OM14, 1160, 676, "V0.3.3", HC_DIM, "rm", 0);
 }
 
 static void hr_menu_draw(int sel, int has_rom, const char *rom_name)
@@ -6560,7 +6576,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("SilverSky v0.3.2 (ROMs en .zip; al cerrar el menu R3 los botones apretados no llegan al juego; menus nuevos a 1280x720 con caratulas en covers/; menu en partida con R3; 6 ranuras de estado; O sale al XMB desde el menu principal; estados guardados online: guarda y carga el host; menus siempre a pantalla completa; codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
+    logf_("SilverSky v0.3.3 (huella online rapida, 1 de cada 4 cuadros; ROMs en .zip; al cerrar el menu R3 los botones apretados no llegan al juego; menus nuevos a 1280x720 con caratulas en covers/; menu en partida con R3; 6 ranuras de estado; O sale al XMB desde el menu principal; estados guardados online: guarda y carga el host; menus siempre a pantalla completa; codigo de sala guardado al unirse; salto de dibujo si va atrasado) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
